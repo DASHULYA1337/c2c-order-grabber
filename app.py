@@ -68,9 +68,10 @@ class App:
         await self._cred_mgr.initialize()
 
         self._client = ApiClient(
-            session    = self._session,
-            get_creds  = self._cred_mgr.get_credentials,
-            aws_region = config.AWS_REGION,
+            session       = self._session,
+            get_creds     = self._cred_mgr.get_credentials,
+            aws_region    = config.AWS_REGION,
+            force_refresh = self._cred_mgr.force_refresh,
         )
 
         self._bot = Bot(

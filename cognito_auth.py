@@ -23,6 +23,7 @@ import asyncio
 import datetime
 import json as _json
 import logging
+from asyncio import Lock
 from dataclasses import dataclass
 from datetime import timedelta, timezone
 from typing import Optional
@@ -163,6 +164,7 @@ class CredentialManager:
         self._region           = region
         self._idp_endpoint     = idp_endpoint
         self._aws_credentials: Optional[AwsCredentials] = None
+        self._lock:            Lock = Lock()
 
     async def initialize(self) -> None:
         logger.info("Authenticating (user=%s)...", self._username)
@@ -170,8 +172,14 @@ class CredentialManager:
 
     async def get_credentials(self) -> AwsCredentials:
         if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
-            await self._refresh()
+            async with self._lock:
+                if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
+                    await self._refresh()
         return self._aws_credentials  # type: ignore[return-value]
+
+    async def force_refresh(self) -> None:
+        async with self._lock:
+            await self._refresh()
 
     async def _refresh(self) -> None:
         logger.info("Obtaining Cognito ID token via %s ...", self._idp_endpoint)

@@ -15,16 +15,18 @@ OnOrderCallback = Callable[[str, Optional[float]], Awaitable[None]]
 class OrderProcessor:
     def __init__(
         self,
-        client:    ApiClient,
-        queue:     asyncio.Queue,
-        on_taken:  OnOrderCallback,
-        on_failed: OnOrderCallback,
+        client:        ApiClient,
+        queue:         asyncio.Queue,
+        on_taken:      OnOrderCallback,
+        on_failed:     OnOrderCallback,
+        on_auth_error: Optional[OnOrderCallback] = None,
     ) -> None:
-        self._client    = client
-        self._queue     = queue
-        self._on_taken  = on_taken
-        self._on_failed = on_failed
-        self._running   = False
+        self._client        = client
+        self._queue         = queue
+        self._on_taken      = on_taken
+        self._on_failed     = on_failed
+        self._on_auth_error = on_auth_error
+        self._running       = False
 
     def stop(self) -> None:
         self._running = False
@@ -61,7 +63,8 @@ class OrderProcessor:
                 logger.info("Order %s already taken by another trader (HTTP %d)", slug, exc.status)
             elif exc.is_auth_error:
                 logger.error("Auth error taking order %s — check API credentials", slug)
-                await self._on_failed(slug, amount)
+                cb = self._on_auth_error if self._on_auth_error is not None else self._on_failed
+                await cb(slug, amount)
             else:
                 logger.error("API error taking order %s: %s", slug, exc)
                 await self._on_failed(slug, amount)
