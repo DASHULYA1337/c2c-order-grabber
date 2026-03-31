@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Set
 
 from api_client import ApiClient, ApiError
-from config import LOOKBACK_MINUTES, TRADER_ID
+from config import LOOKBACK_MINUTES, TRADER_ID, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class OrderMonitor:
         self._seen:       Set[str] = set()
         self._running             = False
         self._first_poll          = True
+        self._latencies           = []
 
     def stop(self) -> None:
         self._running = False
@@ -47,13 +49,45 @@ class OrderMonitor:
             self.poll_interval, LOOKBACK_MINUTES, self.min_amount, self.max_amount,
         )
         while self._running:
+            start = time.monotonic()
             try:
                 await self._poll()
+                latency = time.monotonic() - start
+
+                # Track latency
+                self._latencies.append(latency)
+                logger.debug("Poll latency: %.1fms", latency * 1000)
+
+                # Log stats every 120 polls (~1 minute at 0.5s interval)
+                if len(self._latencies) >= 120:
+                    avg = sum(self._latencies) / len(self._latencies)
+                    max_lat = max(self._latencies)
+                    logger.info(
+                        "Latency stats (last %d polls): avg=%.1fms, max=%.1fms",
+                        len(self._latencies), avg * 1000, max_lat * 1000
+                    )
+                    self._latencies = []
+
+                # Gradually decrease poll interval back to minimum on success
+                if self.poll_interval > MIN_POLL_INTERVAL_S:
+                    self.poll_interval = max(self.poll_interval * 0.95, MIN_POLL_INTERVAL_S)
+
             except asyncio.CancelledError:
                 break
             except ApiError as exc:
+                latency = time.monotonic() - start
                 if exc.status == 429:
-                    logger.error("Poll error: HTTP 429 Too Many Requests: %s", exc.body)
+                    logger.error(
+                        "Poll error after %.1fms: HTTP 429 Too Many Requests: %s",
+                        latency * 1000, exc.body
+                    )
+                    # Adaptive polling: increase interval on rate limit
+                    old_interval = self.poll_interval
+                    self.poll_interval = min(self.poll_interval * 2, MAX_POLL_INTERVAL_S)
+                    logger.warning(
+                        "Increasing poll interval: %.2fs -> %.2fs",
+                        old_interval, self.poll_interval
+                    )
                     if self._on_error:
                         try:
                             await self._on_error(exc)
@@ -61,11 +95,12 @@ class OrderMonitor:
                             logger.warning("Error callback failed: %s", cb_exc)
                     if not self._running:
                         break
-                    await asyncio.sleep(10.0)
+                    await asyncio.sleep(30.0)
                     continue
-                logger.exception("Poll error: %s", exc)
+                logger.exception("Poll error after %.1fms: %s", latency * 1000, exc)
             except Exception as exc:
-                logger.exception("Poll error: %s", exc)
+                latency = time.monotonic() - start
+                logger.exception("Poll error after %.1fms: %s", latency * 1000, exc)
             if not self._running:
                 break
             await asyncio.sleep(self.poll_interval)
