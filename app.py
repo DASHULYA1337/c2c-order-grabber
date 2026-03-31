@@ -55,7 +55,12 @@ class App:
         await init_db()
         await self._load_db_settings()
 
-        connector     = aiohttp.TCPConnector(ssl=True, limit=20, ttl_dns_cache=300)
+        connector     = aiohttp.TCPConnector(
+            ssl=True,
+            limit=20,
+            ttl_dns_cache=600,
+            keepalive_timeout=30
+        )
         self._session = aiohttp.ClientSession(connector=connector)
 
         self._cred_mgr = CredentialManager(
