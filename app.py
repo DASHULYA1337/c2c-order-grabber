@@ -49,7 +49,7 @@ class App:
         self._dp:          Optional[Dispatcher] = None
         self._subscribers: set[int]             = set()
 
-        self._admin_chat_id: int = 1006822567
+        self._admin_chat_id: int = config.ADMIN_CHAT_ID
 
     async def run(self) -> None:
         await init_db()
