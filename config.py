@@ -26,11 +26,14 @@ CARDS2CARDS_PASSWORD     = _require("CARDS2CARDS_PASSWORD")
 COGNITO_IDP_ENDPOINT     = os.environ.get("COGNITO_IDP_ENDPOINT", "https://idp.cards2cards.com")
 
 TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID      = _require("ADMIN_CHAT_ID")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/bot.db")
 LOG_FILE     = os.environ.get("LOG_FILE", "").strip() or None
 
-POLL_INTERVAL_S   = float(os.environ.get("POLL_INTERVAL_S", "0.5"))
-LOOKBACK_MINUTES  = 10
-REQUEST_TIMEOUT_S = 10.0
-MAX_RETRIES       = 3
+POLL_INTERVAL_S     = float(os.environ.get("POLL_INTERVAL_S", "0.5"))
+MIN_POLL_INTERVAL_S = 0.5
+MAX_POLL_INTERVAL_S = 5.0
+LOOKBACK_MINUTES    = 10
+REQUEST_TIMEOUT_S   = 10.0
+MAX_RETRIES         = 3
