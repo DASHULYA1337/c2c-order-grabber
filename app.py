@@ -12,44 +12,26 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
-from api_client import ApiClient
-from cognito_auth import CredentialManager
+from api_client import ApiError
 from db.engine import get_session, init_db
 from db.repository import OrderLogRepository, SettingsRepository, SubscriberRepository
-from monitor import OrderMonitor
-from api_client import ApiError
-from processor import OrderProcessor
+from user_session import UserSession
 
 logger = logging.getLogger(__name__)
 
 
 class App:
     def __init__(self) -> None:
-        self._session:  Optional[aiohttp.ClientSession] = None
-        self._cred_mgr: Optional[CredentialManager]     = None
-        self._client:   Optional[ApiClient]             = None
+        self._session:       Optional[aiohttp.ClientSession] = None
+        self._user_sessions: dict[int, UserSession]          = {}
 
-        self._queue:          asyncio.Queue            = asyncio.Queue()
-        self._monitor:        Optional[OrderMonitor]   = None
-        self._processor:      Optional[OrderProcessor] = None
-        self._monitor_task:   Optional[asyncio.Task]   = None
-        self._processor_task: Optional[asyncio.Task]   = None
+        self._bot:           Optional[Bot]        = None
+        self._dp:            Optional[Dispatcher] = None
 
-        self.is_monitoring: bool               = False
-        self._last_starter_id: Optional[int]   = None
-        self.orders_taken:  int                = 0
-        self.orders_failed: int                = 0
-        self.started_at:    Optional[datetime] = None
-        self.min_amount:    Optional[float]    = None
-        self.max_amount:    Optional[float]    = None
-        self.poll_interval: float              = 1.0
-        self._was_active:   bool               = False
-
-        self._bot:         Optional[Bot]        = None
-        self._dp:          Optional[Dispatcher] = None
-        self._subscribers: set[int]             = set()
-
-        self._admin_chat_id: int = config.ADMIN_CHAT_ID
+        # Default settings loaded from DB
+        self.default_min_amount:    Optional[float] = None
+        self.default_max_amount:    Optional[float] = None
+        self.default_poll_interval: float           = 1.0
 
     async def run(self) -> None:
         await init_db()
@@ -63,39 +45,18 @@ class App:
         )
         self._session = aiohttp.ClientSession(connector=connector)
 
-        self._cred_mgr = CredentialManager(
-            session          = self._session,
-            username         = config.CARDS2CARDS_USERNAME,
-            password         = config.CARDS2CARDS_PASSWORD,
-            client_id        = config.COGNITO_CLIENT_ID,
-            user_pool_id     = config.COGNITO_USER_POOL_ID,
-            identity_pool_id = config.COGNITO_IDENTITY_POOL_ID,
-            region           = config.AWS_REGION,
-            idp_endpoint     = config.COGNITO_IDP_ENDPOINT,
-        )
-        await self._cred_mgr.initialize()
-
-        self._client = ApiClient(
-            session       = self._session,
-            get_creds     = self._cred_mgr.get_credentials,
-            aws_region    = config.AWS_REGION,
-            force_refresh = self._cred_mgr.force_refresh,
-        )
-
         self._bot = Bot(
             token=config.TELEGRAM_BOT_TOKEN,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         self._dp = Dispatcher(storage=MemoryStorage())
 
-        from bot.handlers import control, main_menu, settings as settings_h
+        from bot.handlers import auth, control, main_menu, settings as settings_h
+        self._dp.include_router(auth.router)
         self._dp.include_router(main_menu.router)
         self._dp.include_router(settings_h.router)
         self._dp.include_router(control.router)
         self._dp["app"] = self
-
-        if self._was_active:
-            await self.start_monitoring()
 
         try:
             await self._dp.start_polling(
@@ -103,125 +64,108 @@ class App:
                 allowed_updates=["message", "callback_query"],
             )
         finally:
-            await self.stop_monitoring()
+            await self.stop_all_sessions()
             await self._bot.session.close()
             await self._session.close()
 
-    async def start_monitoring(self, notify: bool = True) -> bool:
-        if self.is_monitoring:
-            return False
+    @property
+    def http_session(self) -> aiohttp.ClientSession:
+        """Get HTTP session."""
+        if not self._session:
+            raise RuntimeError("HTTP session not initialized")
+        return self._session
 
-        self._queue = asyncio.Queue()
-        self._monitor = OrderMonitor(
-            client        = self._client,
-            queue         = self._queue,
-            on_startup_ok = self._on_startup_ok if notify else None,
-            on_error      = self._on_monitor_error,
-            min_amount    = self.min_amount,
-            max_amount    = self.max_amount,
-            poll_interval = self.poll_interval,
+    def get_session(self, chat_id: int) -> Optional[UserSession]:
+        """Get user session by chat_id."""
+        return self._user_sessions.get(chat_id)
+
+    def create_session(
+        self,
+        chat_id:   int,
+        username:  str,
+        password:  str,
+        trader_id: str,
+    ) -> UserSession:
+        """Create new user session."""
+        session = UserSession(
+            chat_id       = chat_id,
+            username      = username,
+            password      = password,
+            trader_id     = trader_id,
+            min_amount    = self.default_min_amount,
+            max_amount    = self.default_max_amount,
+            poll_interval = self.default_poll_interval,
         )
-        self._processor = OrderProcessor(
-            client    = self._client,
-            queue     = self._queue,
-            on_taken  = self._on_taken,
-            on_failed = self._on_failed,
-        )
-        self._monitor_task   = asyncio.create_task(self._monitor.run(),   name="monitor")
-        self._processor_task = asyncio.create_task(self._processor.run(), name="processor")
+        self._user_sessions[chat_id] = session
+        logger.info("Created session for chat_id=%s", chat_id)
+        return session
 
-        self.is_monitoring = True
-        self.started_at    = datetime.now(timezone.utc)
-        self.orders_taken  = 0
-        self.orders_failed = 0
+    async def remove_session(self, chat_id: int) -> None:
+        """Remove user session."""
+        session = self._user_sessions.get(chat_id)
+        if session:
+            await session.stop_monitoring()
+            del self._user_sessions[chat_id]
+            logger.info("Removed session for chat_id=%s", chat_id)
 
-        await self._save_is_active(True)
-        logger.info(
-            "Monitoring started (filter: %s – %s RUB, poll=%.2fs)",
-            self.min_amount, self.max_amount, self.poll_interval,
-        )
-        return True
+    async def stop_all_sessions(self) -> None:
+        """Stop all user sessions."""
+        for session in list(self._user_sessions.values()):
+            await session.stop_monitoring()
+        self._user_sessions.clear()
+        logger.info("All sessions stopped")
 
-    async def stop_monitoring(self) -> bool:
-        if not self.is_monitoring:
-            return False
+    async def _on_taken(self, chat_id: int, slug: str, amount: Optional[float]) -> None:
+        """Callback when order is taken for a specific user."""
+        session = self._user_sessions.get(chat_id)
+        if session:
+            session.orders_taken += 1
 
-        if self._monitor:
-            self._monitor.stop()
-        if self._processor:
-            self._processor.stop()
-
-        tasks = [t for t in (self._monitor_task, self._processor_task) if t]
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        self._monitor_task = self._processor_task = None
-        self.is_monitoring = False
-        await self._save_is_active(False)
-        logger.info("Monitoring stopped")
-        return True
-
-    async def add_subscriber(self, chat_id: int) -> None:
-        if chat_id in self._subscribers:
-            return
-        self._subscribers.add(chat_id)
-        try:
-            async with get_session() as session:
-                repo = SubscriberRepository(session)
-                await repo.add(chat_id)
-        except Exception as exc:
-            logger.warning("Could not persist subscriber %s: %s", chat_id, exc)
-
-    def set_last_starter(self, chat_id: int) -> None:
-        self._last_starter_id = chat_id
-
-    def retry_order(self, slug: str) -> None:
-        if self._monitor:
-            self._monitor._seen.discard(slug)
-
-    async def _on_taken(self, slug: str, amount: Optional[float]) -> None:
-        self.orders_taken += 1
         await self._log_order(slug, amount, "taken")
         amount_str = f"{amount:,.0f} RUB" if amount is not None else "—"
-        await self._notify_taken(
-            f"✅ <b>Ордер взят</b>\n\n"
-            f"ID: <code>{slug}</code>\n"
-            f"Сумма: <b>{amount_str}</b>"
-        )
 
-    async def _on_failed(self, slug: str, amount: Optional[float]) -> None:
-        self.orders_failed += 1
-        await self._log_order(slug, amount, "failed")
-        logger.warning("Order %s failed (amount=%s)", slug, amount)
-
-    async def _on_monitor_error(self, exc: Exception) -> None:
-        if isinstance(exc, ApiError) and exc.is_rate_limited:
-            await self._broadcast(
-                "⚠️ <b>Превышен лимит запросов к API</b>\n\n"
-                "Сервис вернул ошибку HTTP 429 Too Many Requests.\n"
-                f"Текущий интервал опроса: <b>{self.poll_interval:g} сек.</b>\n\n"
-                "Бот сделает паузу на 10 секунд и продолжит работу автоматически."
-            )
-
-    async def _notify_taken(self, text: str) -> None:
-        if not self._bot:
-            return
-
-        targets: set[int] = set()
-        if self._last_starter_id is not None:
-            targets.add(self._last_starter_id)
-        targets.add(self._admin_chat_id)
-
-        for chat_id in targets:
+        if self._bot:
             try:
-                await self._bot.send_message(chat_id, text)
+                await self._bot.send_message(
+                    chat_id,
+                    f"✅ <b>Ордер взят</b>\n\n"
+                    f"ID: <code>{slug}</code>\n"
+                    f"Сумма: <b>{amount_str}</b>"
+                )
             except Exception as exc:
-                logger.warning("TG send (taken) failed to %s: %s", chat_id, exc)
+                logger.warning("Failed to send 'taken' notification to %s: %s", chat_id, exc)
+
+    async def _on_failed(self, chat_id: int, slug: str, amount: Optional[float]) -> None:
+        """Callback when order failed for a specific user."""
+        session = self._user_sessions.get(chat_id)
+        if session:
+            session.orders_failed += 1
+
+        await self._log_order(slug, amount, "failed")
+        logger.warning("Order %s failed for chat_id=%s (amount=%s)", slug, chat_id, amount)
+
+    async def _on_monitor_error(self, chat_id: int, exc: Exception) -> None:
+        """Callback when monitor error occurs for a specific user."""
+        if isinstance(exc, ApiError) and exc.is_rate_limited:
+            session = self._user_sessions.get(chat_id)
+            poll_interval = session.poll_interval if session else "?"
+
+            if self._bot:
+                try:
+                    await self._bot.send_message(
+                        chat_id,
+                        "⚠️ <b>Превышен лимит запросов к API</b>\n\n"
+                        "Сервис вернул ошибку HTTP 429 Too Many Requests.\n"
+                        f"Текущий интервал опроса: <b>{poll_interval:g} сек.</b>\n\n"
+                        "Бот сделает паузу на 10 секунд и продолжит работу автоматически."
+                    )
+                except Exception as send_exc:
+                    logger.warning("Failed to send error notification to %s: %s", chat_id, send_exc)
 
     async def _on_startup_ok(
-        self, min_amount: Optional[float], max_amount: Optional[float]
+        self, chat_id: int, min_amount: Optional[float], max_amount: Optional[float]
     ) -> None:
+        """Callback when monitoring successfully starts for a user."""
         lo = f"{int(min_amount):,}" if min_amount is not None else "—"
         hi = f"{int(max_amount):,}" if max_amount is not None else "—"
         filter_line = (
@@ -229,20 +173,17 @@ class App:
             if (min_amount is not None or max_amount is not None)
             else "Фильтр суммы: не задан"
         )
-        await self._broadcast(
-            "🤖 <b>Бот успешно запущен</b>\n\n"
-            f"{filter_line}\n"
-            "Мониторинг новых ордеров начат"
-        )
 
-    async def _broadcast(self, text: str) -> None:
-        if not self._bot or not self._subscribers:
-            return
-        for chat_id in self._subscribers:
+        if self._bot:
             try:
-                await self._bot.send_message(chat_id, text)
+                await self._bot.send_message(
+                    chat_id,
+                    "🤖 <b>Бот успешно запущен</b>\n\n"
+                    f"{filter_line}\n"
+                    "Мониторинг новых ордеров начат"
+                )
             except Exception as exc:
-                logger.warning("TG send failed to %s: %s", chat_id, exc)
+                logger.warning("Failed to send startup notification to %s: %s", chat_id, exc)
 
     async def _log_order(self, slug: str, amount: Optional[float], status: str) -> None:
         try:
@@ -253,28 +194,19 @@ class App:
             logger.warning("Failed to log order %s to DB: %s", slug, exc)
 
     async def _load_db_settings(self) -> None:
+        """Load default settings from database."""
         try:
             async with get_session() as session:
                 settings_repo = SettingsRepository(session)
                 settings = await settings_repo.get_or_create()
-                sub_repo = SubscriberRepository(session)
-                chat_ids = await sub_repo.get_all()
-            self.min_amount    = settings.min_amount
-            self.max_amount    = settings.max_amount
-            self.poll_interval = settings.poll_interval
-            self._was_active   = settings.is_active
-            self._subscribers  = set(chat_ids)
+
+            self.default_min_amount    = settings.min_amount
+            self.default_max_amount    = settings.max_amount
+            self.default_poll_interval = settings.poll_interval
+
             logger.info(
-                "DB settings: min=%s max=%s was_active=%s subscribers=%s",
-                self.min_amount, self.max_amount, self._was_active, list(self._subscribers),
+                "Default settings loaded: min=%s max=%s poll=%.2fs",
+                self.default_min_amount, self.default_max_amount, self.default_poll_interval,
             )
         except Exception as exc:
             logger.warning("Could not load DB settings: %s", exc)
-
-    async def _save_is_active(self, value: bool) -> None:
-        try:
-            async with get_session() as session:
-                repo = SettingsRepository(session)
-                await repo.update(is_active=value)
-        except Exception as exc:
-            logger.warning("Could not save is_active to DB: %s", exc)

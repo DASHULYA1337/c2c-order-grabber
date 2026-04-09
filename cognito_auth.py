@@ -26,7 +26,7 @@ import logging
 from asyncio import Lock
 from dataclasses import dataclass
 from datetime import timedelta, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 
 # AWS Cognito service content-type
 _AMZN_JSON = "application/x-amz-json-1.1"
+
+# Type for MFA code callback
+MfaCodeCallback = Callable[[], Awaitable[str]]
+
+
+class MfaRequiredException(Exception):
+    """Raised when MFA is required but no callback provided."""
+    def __init__(self, session: str, challenge_name: str) -> None:
+        self.session = session
+        self.challenge_name = challenge_name
+        super().__init__(f"MFA required: {challenge_name}")
 
 
 @dataclass
@@ -77,13 +88,28 @@ async def get_id_token(
     username:         str,
     password:         str,
     idp_endpoint:     str = "https://idp.cards2cards.com",
-) -> str:
+    mfa_callback:     Optional[MfaCodeCallback] = None,
+    device_key:       Optional[str] = None,
+) -> tuple[str, Optional[str]]:
     """
     Authenticate with Cognito via the CloudFront proxy and return an ID token.
 
     Uses USER_PASSWORD_AUTH flow.  The custom endpoint bypasses the WAF
     that protects the direct cognito-idp.*.amazonaws.com endpoint.
+
+    Returns:
+        tuple[str, Optional[str]]: (id_token, new_device_key)
+
+    Raises:
+        MfaRequiredException: If MFA is required but no callback provided
     """
+    auth_params = {
+        "USERNAME": username,
+        "PASSWORD": password,
+    }
+    if device_key:
+        auth_params["DEVICE_KEY"] = device_key
+
     data = await _post(
         session,
         url     = idp_endpoint.rstrip("/") + "/",
@@ -91,18 +117,93 @@ async def get_id_token(
         payload = {
             "AuthFlow":       "USER_PASSWORD_AUTH",
             "ClientId":       client_id,
-            "AuthParameters": {
+            "AuthParameters": auth_params,
+        },
+    )
+
+    # Check if authentication succeeded without MFA
+    if "AuthenticationResult" in data:
+        id_token = data["AuthenticationResult"]["IdToken"]
+        new_device_key = data["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
+        return id_token, new_device_key
+
+    # Check if MFA challenge is required
+    challenge_name = data.get("ChallengeName")
+    if challenge_name in ("SOFTWARE_TOKEN_MFA", "SMS_MFA"):
+        if not mfa_callback:
+            raise MfaRequiredException(
+                session=data["Session"],
+                challenge_name=challenge_name,
+            )
+
+        # Request MFA code from user
+        logger.info("MFA challenge required: %s", challenge_name)
+        mfa_code = await mfa_callback()
+
+        # Respond to MFA challenge
+        response = await _post(
+            session,
+            url     = idp_endpoint.rstrip("/") + "/",
+            target  = "AWSCognitoIdentityProviderService.RespondToAuthChallenge",
+            payload = {
+                "ChallengeName": challenge_name,
+                "ClientId":      client_id,
+                "Session":       data["Session"],
+                "ChallengeResponses": {
+                    "USERNAME": username,
+                    f"{challenge_name}_CODE": mfa_code,
+                },
+            },
+        )
+
+        if "AuthenticationResult" not in response:
+            raise RuntimeError(f"MFA challenge failed. Response: {response}")
+
+        id_token = response["AuthenticationResult"]["IdToken"]
+        new_device_key = response["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
+        return id_token, new_device_key
+
+    raise RuntimeError(
+        f"InitiateAuth returned unexpected response. Response: {data}"
+    )
+
+
+async def respond_to_mfa_challenge(
+    session:       aiohttp.ClientSession,
+    client_id:     str,
+    username:      str,
+    mfa_session:   str,
+    challenge_name: str,
+    mfa_code:      str,
+    idp_endpoint:  str = "https://idp.cards2cards.com",
+) -> tuple[str, Optional[str]]:
+    """
+    Respond to an MFA challenge with a code.
+
+    Returns:
+        tuple[str, Optional[str]]: (id_token, new_device_key)
+    """
+    response = await _post(
+        session,
+        url     = idp_endpoint.rstrip("/") + "/",
+        target  = "AWSCognitoIdentityProviderService.RespondToAuthChallenge",
+        payload = {
+            "ChallengeName": challenge_name,
+            "ClientId":      client_id,
+            "Session":       mfa_session,
+            "ChallengeResponses": {
                 "USERNAME": username,
-                "PASSWORD": password,
+                f"{challenge_name}_CODE": mfa_code,
             },
         },
     )
-    try:
-        return data["AuthenticationResult"]["IdToken"]
-    except KeyError:
-        raise RuntimeError(
-            f"InitiateAuth did not return an IdToken. Response: {data}"
-        )
+
+    if "AuthenticationResult" not in response:
+        raise RuntimeError(f"MFA challenge failed. Response: {response}")
+
+    id_token = response["AuthenticationResult"]["IdToken"]
+    new_device_key = response["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
+    return id_token, new_device_key
 
 
 async def get_aws_credentials(
@@ -154,6 +255,7 @@ class CredentialManager:
         identity_pool_id: str,
         region:           str,
         idp_endpoint:     str = "https://idp.cards2cards.com",
+        mfa_callback:     Optional[MfaCodeCallback] = None,
     ) -> None:
         self._session          = session
         self._username         = username
@@ -163,7 +265,9 @@ class CredentialManager:
         self._identity_pool_id = identity_pool_id
         self._region           = region
         self._idp_endpoint     = idp_endpoint
+        self._mfa_callback     = mfa_callback
         self._aws_credentials: Optional[AwsCredentials] = None
+        self._device_key:      Optional[str] = None
         self._lock:            Lock = Lock()
 
     async def initialize(self) -> None:
@@ -183,13 +287,23 @@ class CredentialManager:
 
     async def _refresh(self) -> None:
         logger.info("Obtaining Cognito ID token via %s ...", self._idp_endpoint)
-        id_token = await get_id_token(
-            self._session,
-            client_id    = self._client_id,
-            username     = self._username,
-            password     = self._password,
-            idp_endpoint = self._idp_endpoint,
-        )
+        try:
+            id_token, new_device_key = await get_id_token(
+                self._session,
+                client_id    = self._client_id,
+                username     = self._username,
+                password     = self._password,
+                idp_endpoint = self._idp_endpoint,
+                mfa_callback = self._mfa_callback,
+                device_key   = self._device_key,
+            )
+            if new_device_key:
+                self._device_key = new_device_key
+                logger.info("Device key obtained: %s", new_device_key[:20] + "...")
+        except MfaRequiredException:
+            logger.error("MFA required but callback not available during refresh")
+            raise
+
         logger.info("Exchanging ID token for AWS STS credentials...")
         self._aws_credentials = await get_aws_credentials(
             self._session,

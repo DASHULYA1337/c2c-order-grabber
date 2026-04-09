@@ -28,29 +28,45 @@ async def _show_settings_menu(callback: CallbackQuery, state: FSMContext) -> Non
 
 
 @router.callback_query(F.data == "settings:menu")
-async def settings_menu(callback: CallbackQuery, state: FSMContext) -> None:
+async def settings_menu(callback: CallbackQuery, state: FSMContext, app) -> None:
+    chat_id = callback.message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await callback.answer("Вы не авторизованы.", show_alert=True)
+        return
+
     await _show_settings_menu(callback, state)
 
 
 @router.callback_query(F.data == "settings:back")
 async def settings_back(callback: CallbackQuery, state: FSMContext, app) -> None:
+    chat_id = callback.message.chat.id
+    session = app.get_session(chat_id)
+
     await state.clear()
     await callback.message.edit_text(
         "Главное меню:",
-        reply_markup=main_menu_keyboard(app.is_monitoring),
+        reply_markup=main_menu_keyboard(
+            session.is_monitoring if session else False,
+            is_authenticated=session is not None,
+        ),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "settings:filters")
-async def filters_start(callback: CallbackQuery, state: FSMContext) -> None:
+async def filters_start(callback: CallbackQuery, state: FSMContext, app) -> None:
+    chat_id = callback.message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await callback.answer("Вы не авторизованы.", show_alert=True)
+        return
+
     await state.clear()
 
-    async with get_session() as session:
-        repo = SettingsRepository(session)
-        settings = await repo.get_or_create()
-
-    min_hint = f" (сейчас: {settings.min_amount:,.0f})" if settings.min_amount else ""
+    min_hint = f" (сейчас: {session.min_amount:,.0f})" if session.min_amount else ""
     await callback.message.edit_text(
         f"Введите минимальную сумму ордера (₽){min_hint}.\n"
         "Отправьте <b>-</b> чтобы не ограничивать.",
@@ -61,7 +77,15 @@ async def filters_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(FiltersFSM.min_amount)
-async def filters_min_amount(message: Message, state: FSMContext) -> None:
+async def filters_min_amount(message: Message, state: FSMContext, app) -> None:
+    chat_id = message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await message.answer("Вы не авторизованы.")
+        await state.clear()
+        return
+
     text = message.text.strip()
     if text in ("0", "-", "нет", ""):
         await state.update_data(min_amount=None)
@@ -76,10 +100,7 @@ async def filters_min_amount(message: Message, state: FSMContext) -> None:
             )
             return
 
-    async with get_session() as session:
-        repo = SettingsRepository(session)
-        settings = await repo.get_or_create()
-    max_hint = f" (сейчас: {settings.max_amount:,.0f})" if settings.max_amount else ""
+    max_hint = f" (сейчас: {session.max_amount:,.0f})" if session.max_amount else ""
     await message.answer(
         f"Введите максимальную сумму ордера (₽){max_hint}.\n"
         "Отправьте <b>-</b> чтобы не ограничивать.",
@@ -120,21 +141,42 @@ async def filters_max_amount(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "filters:save", FiltersFSM.confirm)
 async def filters_save(callback: CallbackQuery, state: FSMContext, app) -> None:
+    chat_id = callback.message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await callback.answer("Вы не авторизованы.", show_alert=True)
+        await state.clear()
+        return
+
     data = await state.get_data()
     await state.clear()
 
     mn = data.get("min_amount")
     mx = data.get("max_amount")
 
-    async with get_session() as session:
-        repo = SettingsRepository(session)
-        await repo.update(min_amount=mn, max_amount=mx)
+    session.min_amount = mn
+    session.max_amount = mx
 
-    app.min_amount = mn
-    app.max_amount = mx
-    if app.is_monitoring:
-        await app.stop_monitoring()
-        await app.start_monitoring(notify=False)
+    # Restart monitoring if running
+    if session.is_monitoring:
+        await session.stop_monitoring()
+
+        # Recreate callbacks
+        async def on_taken(slug: str, amount: float | None) -> None:
+            await app._on_taken(chat_id, slug, amount)
+
+        async def on_failed(slug: str, amount: float | None) -> None:
+            await app._on_failed(chat_id, slug, amount)
+
+        async def on_error(exc: Exception) -> None:
+            await app._on_monitor_error(chat_id, exc)
+
+        await session.start_monitoring(
+            on_taken  = on_taken,
+            on_failed = on_failed,
+            on_error  = on_error,
+        )
 
     await callback.message.edit_text(
         "✅ Фильтры суммы сохранены.",
@@ -160,13 +202,17 @@ class PollIntervalFSM(StatesGroup):
 
 
 @router.callback_query(F.data == "settings:poll_interval")
-async def poll_interval_start(callback: CallbackQuery, state: FSMContext) -> None:
+async def poll_interval_start(callback: CallbackQuery, state: FSMContext, app) -> None:
+    chat_id = callback.message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await callback.answer("Вы не авторизованы.", show_alert=True)
+        return
+
     await state.clear()
-    async with get_session() as session:
-        repo = SettingsRepository(session)
-        settings = await repo.get_or_create()
     await callback.message.edit_text(
-        f"⏱ Введите интервал опроса в секундах (сейчас: {settings.poll_interval:g}).\n"
+        f"⏱ Введите интервал опроса в секундах (сейчас: {session.poll_interval:g}).\n"
         "Минимум: 0.1, максимум: 60.",
         reply_markup=cancel_keyboard("settings:menu"),
     )
@@ -176,6 +222,14 @@ async def poll_interval_start(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(PollIntervalFSM.value)
 async def poll_interval_set(message: Message, state: FSMContext, app) -> None:
+    chat_id = message.chat.id
+    session = app.get_session(chat_id)
+
+    if not session:
+        await message.answer("Вы не авторизованы.")
+        await state.clear()
+        return
+
     raw = message.text.strip().replace(",", ".")
     try:
         value = float(raw)
@@ -190,14 +244,27 @@ async def poll_interval_set(message: Message, state: FSMContext, app) -> None:
 
     await state.clear()
 
-    async with get_session() as session:
-        repo = SettingsRepository(session)
-        await repo.update(poll_interval=value)
+    session.poll_interval = value
 
-    app.poll_interval = value
-    if app.is_monitoring:
-        await app.stop_monitoring()
-        await app.start_monitoring(notify=False)
+    # Restart monitoring if running
+    if session.is_monitoring:
+        await session.stop_monitoring()
+
+        # Recreate callbacks
+        async def on_taken(slug: str, amount: float | None) -> None:
+            await app._on_taken(chat_id, slug, amount)
+
+        async def on_failed(slug: str, amount: float | None) -> None:
+            await app._on_failed(chat_id, slug, amount)
+
+        async def on_error(exc: Exception) -> None:
+            await app._on_monitor_error(chat_id, exc)
+
+        await session.start_monitoring(
+            on_taken  = on_taken,
+            on_failed = on_failed,
+            on_error  = on_error,
+        )
 
     await message.answer(
         f"✅ Интервал опроса сохранён: {value:g} сек.",

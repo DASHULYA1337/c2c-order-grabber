@@ -15,15 +15,18 @@ def _require(key: str) -> str:
 
 
 API_BASE_URL = "https://api.cards2cards.com"
-TRADER_ID    = _require("TRADER_ID")
 
 AWS_REGION               = _require("AWS_REGION")
 COGNITO_CLIENT_ID        = _require("COGNITO_CLIENT_ID")
 COGNITO_USER_POOL_ID     = _require("COGNITO_USER_POOL_ID")
 COGNITO_IDENTITY_POOL_ID = _require("COGNITO_IDENTITY_POOL_ID")
-CARDS2CARDS_USERNAME     = _require("CARDS2CARDS_USERNAME")
-CARDS2CARDS_PASSWORD     = _require("CARDS2CARDS_PASSWORD")
 COGNITO_IDP_ENDPOINT     = os.environ.get("COGNITO_IDP_ENDPOINT", "https://idp.cards2cards.com")
+
+# Legacy: credentials are now provided per-user through Telegram bot
+# These are optional for backwards compatibility
+CARDS2CARDS_USERNAME = os.environ.get("CARDS2CARDS_USERNAME", "").strip()
+CARDS2CARDS_PASSWORD = os.environ.get("CARDS2CARDS_PASSWORD", "").strip()
+TRADER_ID            = os.environ.get("TRADER_ID", "").strip()
 
 TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID      = _require("ADMIN_CHAT_ID")

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Set
 
 from api_client import ApiClient, ApiError
-from config import LOOKBACK_MINUTES, TRADER_ID, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S
+from config import LOOKBACK_MINUTES, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class OrderMonitor:
         self,
         client:        ApiClient,
         queue:         asyncio.Queue,
+        trader_id:     str,
         on_startup_ok: Optional[OnStartupCallback] = None,
         on_error:      Optional[OnErrorCallback]   = None,
         min_amount:    Optional[float]             = None,
@@ -28,6 +29,7 @@ class OrderMonitor:
     ) -> None:
         self._client        = client
         self._queue         = queue
+        self._trader_id     = trader_id
         self._on_startup    = on_startup_ok
         self._on_error      = on_error
         self.min_amount     = min_amount
@@ -107,7 +109,7 @@ class OrderMonitor:
 
     async def _poll(self) -> None:
         since  = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
-        orders = await self._client.get_orders(TRADER_ID, since)
+        orders = await self._client.get_orders(self._trader_id, since)
 
         if self._first_poll:
             self._first_poll = False

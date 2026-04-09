@@ -2,14 +2,21 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-def main_menu_keyboard(is_running: bool) -> InlineKeyboardMarkup:
+def main_menu_keyboard(is_running: bool, is_authenticated: bool = True) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    if is_running:
+
+    if not is_authenticated:
+        builder.button(text="🔐 Авторизоваться", callback_data="auth:login")
+    elif is_running:
         builder.button(text="⏹ Остановить бота", callback_data="bot:stop")
     else:
         builder.button(text="▶️ Запустить бота", callback_data="bot:start")
-    builder.button(text="⚙️ Настройки",  callback_data="settings:menu")
-    builder.button(text="📊 Статистика",  callback_data="stats:show")
+
+    if is_authenticated:
+        builder.button(text="⚙️ Настройки",  callback_data="settings:menu")
+        builder.button(text="📊 Статистика",  callback_data="stats:show")
+        builder.button(text="🚪 Выйти",       callback_data="auth:logout")
+
     builder.adjust(1)
     return builder.as_markup()
 
@@ -25,7 +32,10 @@ def settings_menu_keyboard() -> InlineKeyboardMarkup:
 
 def cancel_keyboard(back_to: str = "settings:menu") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="✖️ Отмена", callback_data=back_to)
+    if back_to == "main:menu":
+        builder.button(text="◀️ Назад", callback_data=back_to)
+    else:
+        builder.button(text="✖️ Отмена", callback_data=back_to)
     return builder.as_markup()
 
 
