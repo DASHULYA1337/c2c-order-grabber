@@ -9,3 +9,4 @@ geckodriver.log
 *.sqlite
 venv/
 .venv/
+MIGRATION_GUIDE.md
