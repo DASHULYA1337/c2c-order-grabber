@@ -180,6 +180,36 @@ async def _post(
     return body
 
 
+async def _confirm_device(
+    session:       aiohttp.ClientSession,
+    access_token:  str,
+    device_key:    str,
+    idp_endpoint:  str = "https://idp.cards2cards.com",
+) -> None:
+    """
+    Confirm device to enable device tracking and allow refresh token to work.
+
+    AWS Cognito requires device confirmation after first authentication with a new device.
+    Without this, refresh token will fail with "Invalid Refresh Token" error.
+    """
+    try:
+        logger.info("Confirming device %s...", device_key[:20] + "...")
+        await _post(
+            session,
+            url     = idp_endpoint.rstrip("/") + "/",
+            target  = "AWSCognitoIdentityProviderService.ConfirmDevice",
+            payload = {
+                "AccessToken": access_token,
+                "DeviceKey": device_key,
+                "DeviceName": "c2c-order-grabber-bot",
+            },
+        )
+        logger.info("Device confirmed successfully")
+    except CognitoHttpError as e:
+        # Non-fatal - log and continue (device tracking will be disabled)
+        logger.warning("Failed to confirm device (device tracking disabled): %s", e)
+
+
 async def get_id_token(
     session:          aiohttp.ClientSession,
     client_id:        str,
@@ -206,10 +236,12 @@ async def get_id_token(
     if refresh_token:
         logger.info("Attempting token refresh using refresh_token...")
         auth_params = {"REFRESH_TOKEN": refresh_token}
-        # CRITICAL: Include device_key if available (AWS requires it for device-tracked sessions)
+
+        # IMPORTANT: When device tracking is enabled, device_key MUST be included
+        # AWS Cognito docs: "to get new tokens with a refresh token, you must include the device key"
         if device_key:
             auth_params["DEVICE_KEY"] = device_key
-            logger.debug("Including device_key in refresh request")
+            logger.debug("Including device_key in refresh request: %s", device_key[:20] + "...")
 
         refresh_data = await _post(
             session,
@@ -252,8 +284,14 @@ async def get_id_token(
     # Check if authentication succeeded without MFA
     if "AuthenticationResult" in data:
         id_token = data["AuthenticationResult"]["IdToken"]
+        access_token = data["AuthenticationResult"]["AccessToken"]
         new_device_key = data["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
         new_refresh_token = data["AuthenticationResult"].get("RefreshToken")
+
+        # Confirm device if new device key was issued
+        if new_device_key:
+            await _confirm_device(session, access_token, new_device_key, idp_endpoint)
+
         return id_token, new_device_key, new_refresh_token
 
     # Check if MFA challenge is required
@@ -289,8 +327,14 @@ async def get_id_token(
             raise RuntimeError(f"MFA challenge failed. Response: {response}")
 
         id_token = response["AuthenticationResult"]["IdToken"]
+        access_token = response["AuthenticationResult"]["AccessToken"]
         new_device_key = response["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
         new_refresh_token = response["AuthenticationResult"].get("RefreshToken")
+
+        # Confirm device if new device key was issued
+        if new_device_key:
+            await _confirm_device(session, access_token, new_device_key, idp_endpoint)
+
         return id_token, new_device_key, new_refresh_token
 
     raise RuntimeError(
