@@ -9,3 +9,5 @@ geckodriver.log
 *.sqlite
 venv/
 .venv/
+*.pem
+*.md
