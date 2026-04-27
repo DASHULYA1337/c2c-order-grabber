@@ -29,11 +29,11 @@ async def bot_start(callback: CallbackQuery, app) -> None:
     await callback.message.edit_text("Запускаю бота, подождите...")
 
     # Start monitoring with callbacks
-    async def on_taken(slug: str, amount: float | None) -> None:
-        await app._on_taken(chat_id, slug, amount)
+    async def on_taken(slug: str, amount: float | None, error_reason: str | None) -> None:
+        await app._on_taken(chat_id, slug, amount, error_reason)
 
-    async def on_failed(slug: str, amount: float | None) -> None:
-        await app._on_failed(chat_id, slug, amount)
+    async def on_failed(slug: str, amount: float | None, error_reason: str | None) -> None:
+        await app._on_failed(chat_id, slug, amount, error_reason)
 
     async def on_startup_ok(min_amt: float | None, max_amt: float | None) -> None:
         await app._on_startup_ok(chat_id, min_amt, max_amt)
@@ -88,9 +88,9 @@ async def stats_show(callback: CallbackQuery, app) -> None:
 
     async with get_session() as db_session:
         log_repo = OrderLogRepository(db_session)
-        taken  = await log_repo.count_taken()
-        failed = await log_repo.count_failed()
-        last   = await log_repo.last_entries(5)
+        taken  = await log_repo.count_taken(chat_id)
+        failed = await log_repo.count_failed(chat_id)
+        last   = await log_repo.last_entries(chat_id, 5)
 
     lines = [
         "<b>Статистика</b>\n",

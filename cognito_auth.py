@@ -23,12 +23,14 @@ import asyncio
 import datetime
 import json as _json
 import logging
+import random
 from asyncio import Lock
 from dataclasses import dataclass
 from datetime import timedelta, timezone
 from typing import Awaitable, Callable, Optional
 
 import aiohttp
+from curl_cffi.requests import AsyncSession as CurlSession
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,48 @@ _AMZN_JSON = "application/x-amz-json-1.1"
 # Type for MFA code callback
 MfaCodeCallback = Callable[[], Awaitable[str]]
 
+# User-Agent rotation pool (different browsers/OS)
+_USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def _get_random_user_agent() -> str:
+    """Get a random User-Agent from the pool."""
+    return random.choice(_USER_AGENTS)
+
+
+# Global curl_cffi session for cookie persistence (bypasses CloudFront WAF)
+# This session is reused across all requests to maintain cookies and appear as single browser
+_curl_session: Optional[CurlSession] = None
+_curl_session_lock = Lock()
+
+
+async def _get_curl_session() -> CurlSession:
+    """Get or create global curl_cffi session with Chrome impersonation."""
+    global _curl_session
+
+    async with _curl_session_lock:
+        if _curl_session is None:
+            logger.info("Creating persistent curl_cffi session (Chrome 120 impersonation)")
+            _curl_session = CurlSession(impersonate="chrome120")
+
+        return _curl_session
+
+
+async def cleanup_curl_session():
+    """Cleanup global curl_cffi session on shutdown."""
+    global _curl_session
+
+    async with _curl_session_lock:
+        if _curl_session is not None:
+            logger.debug("Closing curl_cffi session")
+            await _curl_session.close()
+            _curl_session = None
+
 
 class MfaRequiredException(Exception):
     """Raised when MFA is required but no callback provided."""
@@ -45,6 +89,13 @@ class MfaRequiredException(Exception):
         self.session = session
         self.challenge_name = challenge_name
         super().__init__(f"MFA required: {challenge_name}")
+
+
+class CognitoHttpError(Exception):
+    """HTTP error from Cognito endpoint."""
+    def __init__(self, status: int, message: str) -> None:
+        self.status = status
+        super().__init__(message)
 
 
 @dataclass
@@ -64,21 +115,68 @@ async def _post(
     target:  str,
     payload: dict,
 ) -> dict:
-    """POST to an AWS JSON 1.1 endpoint; return parsed JSON body."""
-    async with session.post(
-        url,
-        data=_json.dumps(payload),
-        headers={
-            "X-Amz-Target":  target,
-            "Content-Type":  _AMZN_JSON,
-        },
-        timeout=aiohttp.ClientTimeout(total=15),
-    ) as resp:
-        body = await resp.json(content_type=None)
-        if resp.status != 200:
-            raise RuntimeError(
-                f"{target} failed (HTTP {resp.status}): {body}"
-            )
+    """
+    POST to an AWS JSON 1.1 endpoint with browser impersonation.
+
+    Uses persistent curl_cffi session to:
+    - Impersonate Chrome browser (bypass TLS fingerprinting)
+    - Maintain cookies across requests (appear as single browser session)
+    - Bypass CloudFront WAF bot detection
+    """
+    from curl_cffi.requests.exceptions import Timeout as CurlTimeout
+
+    # Get global curl_cffi session (reused across all requests for cookie persistence)
+    curl_session = await _get_curl_session()
+
+    request_headers = {
+        "X-Amz-Target":  target,
+        "Content-Type":  _AMZN_JSON,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://cards2cards.com",
+        "Referer": "https://cards2cards.com/",
+    }
+
+    try:
+        resp = await curl_session.post(
+            url,
+            data=_json.dumps(payload),
+            headers=request_headers,
+            timeout=15,
+        )
+    except CurlTimeout as e:
+        # curl_cffi timeout bug - session is stuck, recreate it
+        logger.warning("curl_cffi session timeout, recreating session...")
+        await cleanup_curl_session()  # Close stuck session
+        # Retry with fresh session
+        curl_session = await _get_curl_session()
+        resp = await curl_session.post(
+            url,
+            data=_json.dumps(payload),
+            headers=request_headers,
+            timeout=15,
+        )
+
+    # Get response text
+    text = resp.text
+    status = resp.status_code
+
+    # Try to parse as JSON
+    try:
+        body = _json.loads(text) if text else {}
+    except _json.JSONDecodeError as e:
+        # Non-JSON response (likely CloudFront WAF block)
+        raise CognitoHttpError(
+            status,
+            f"{target} returned invalid JSON (HTTP {status}): {text[:500]}"
+        ) from e
+
+    if status != 200:
+        raise CognitoHttpError(
+            status,
+            f"{target} failed (HTTP {status}): {body}"
+        )
+
     return body
 
 
@@ -90,19 +188,49 @@ async def get_id_token(
     idp_endpoint:     str = "https://idp.cards2cards.com",
     mfa_callback:     Optional[MfaCodeCallback] = None,
     device_key:       Optional[str] = None,
-) -> tuple[str, Optional[str]]:
+    refresh_token:    Optional[str] = None,
+) -> tuple[str, Optional[str], Optional[str]]:
     """
     Authenticate with Cognito via the CloudFront proxy and return an ID token.
 
-    Uses USER_PASSWORD_AUTH flow.  The custom endpoint bypasses the WAF
-    that protects the direct cognito-idp.*.amazonaws.com endpoint.
+    Uses USER_PASSWORD_AUTH flow (or REFRESH_TOKEN_AUTH if refresh_token provided).
+    The custom endpoint bypasses the WAF that protects the direct cognito-idp.*.amazonaws.com endpoint.
 
     Returns:
-        tuple[str, Optional[str]]: (id_token, new_device_key)
+        tuple[str, Optional[str], Optional[str]]: (id_token, new_device_key, refresh_token)
 
     Raises:
         MfaRequiredException: If MFA is required but no callback provided
     """
+    # If refresh token available, try refreshing first (no password/MFA needed)
+    if refresh_token:
+        logger.info("Attempting token refresh using refresh_token...")
+        auth_params = {"REFRESH_TOKEN": refresh_token}
+        # CRITICAL: Include device_key if available (AWS requires it for device-tracked sessions)
+        if device_key:
+            auth_params["DEVICE_KEY"] = device_key
+            logger.debug("Including device_key in refresh request")
+
+        refresh_data = await _post(
+            session,
+            url     = idp_endpoint.rstrip("/") + "/",
+            target  = "AWSCognitoIdentityProviderService.InitiateAuth",
+            payload = {
+                "AuthFlow": "REFRESH_TOKEN_AUTH",
+                "ClientId": client_id,
+                "AuthParameters": auth_params,
+            },
+        )
+        if "AuthenticationResult" in refresh_data:
+            id_token = refresh_data["AuthenticationResult"]["IdToken"]
+            # Refresh doesn't return new refresh_token or device_key, keep existing ones
+            logger.info("Token refreshed successfully using refresh_token")
+            return id_token, device_key, refresh_token
+        else:
+            # Refresh token invalid - this should trigger re-authentication
+            raise RuntimeError("Refresh token invalid/expired - re-authentication required")
+
+    # Password authentication (only during initial login)
     auth_params = {
         "USERNAME": username,
         "PASSWORD": password,
@@ -125,7 +253,8 @@ async def get_id_token(
     if "AuthenticationResult" in data:
         id_token = data["AuthenticationResult"]["IdToken"]
         new_device_key = data["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
-        return id_token, new_device_key
+        new_refresh_token = data["AuthenticationResult"].get("RefreshToken")
+        return id_token, new_device_key, new_refresh_token
 
     # Check if MFA challenge is required
     challenge_name = data.get("ChallengeName")
@@ -161,7 +290,8 @@ async def get_id_token(
 
         id_token = response["AuthenticationResult"]["IdToken"]
         new_device_key = response["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
-        return id_token, new_device_key
+        new_refresh_token = response["AuthenticationResult"].get("RefreshToken")
+        return id_token, new_device_key, new_refresh_token
 
     raise RuntimeError(
         f"InitiateAuth returned unexpected response. Response: {data}"
@@ -256,6 +386,10 @@ class CredentialManager:
         region:           str,
         idp_endpoint:     str = "https://idp.cards2cards.com",
         mfa_callback:     Optional[MfaCodeCallback] = None,
+        device_key:       Optional[str] = None,
+        refresh_token:    Optional[str] = None,
+        on_device_key_changed: Optional[Callable[[Optional[str]], Awaitable[None]]] = None,
+        on_refresh_token_changed: Optional[Callable[[Optional[str]], Awaitable[None]]] = None,
     ) -> None:
         self._session          = session
         self._username         = username
@@ -267,42 +401,96 @@ class CredentialManager:
         self._idp_endpoint     = idp_endpoint
         self._mfa_callback     = mfa_callback
         self._aws_credentials: Optional[AwsCredentials] = None
-        self._device_key:      Optional[str] = None
+        self._device_key:      Optional[str] = device_key  # Persisted - needed for refresh_token
+        self._refresh_token:   Optional[str] = refresh_token
+        self._on_device_key_changed = on_device_key_changed
+        self._on_refresh_token_changed = on_refresh_token_changed
         self._lock:            Lock = Lock()
 
     async def initialize(self) -> None:
         logger.info("Authenticating (user=%s)...", self._username)
-        await self._refresh()
+        await self._refresh(use_mfa_callback=True)  # Initial auth - allow MFA
 
     async def get_credentials(self) -> AwsCredentials:
         if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
             async with self._lock:
                 if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
-                    await self._refresh()
+                    await self._refresh(use_mfa_callback=False)  # Auto-refresh - no MFA
         return self._aws_credentials  # type: ignore[return-value]
 
     async def force_refresh(self) -> None:
         async with self._lock:
-            await self._refresh()
+            await self._refresh(use_mfa_callback=False)  # Manual refresh - no MFA
 
-    async def _refresh(self) -> None:
+    async def _refresh(self, use_mfa_callback: bool = False) -> None:
         logger.info("Obtaining Cognito ID token via %s ...", self._idp_endpoint)
         try:
-            id_token, new_device_key = await get_id_token(
+            # During initial auth, use mfa_callback to prompt user
+            # During auto-refresh, use refresh_token (no password/MFA needed!)
+            id_token, new_device_key, new_refresh_token = await get_id_token(
                 self._session,
-                client_id    = self._client_id,
-                username     = self._username,
-                password     = self._password,
-                idp_endpoint = self._idp_endpoint,
-                mfa_callback = self._mfa_callback,
-                device_key   = self._device_key,
+                client_id     = self._client_id,
+                username      = self._username,
+                password      = self._password,
+                idp_endpoint  = self._idp_endpoint,
+                mfa_callback  = self._mfa_callback if use_mfa_callback else None,
+                device_key    = self._device_key,
+                refresh_token = self._refresh_token,
             )
-            if new_device_key:
+            if new_device_key and new_device_key != self._device_key:
                 self._device_key = new_device_key
                 logger.info("Device key obtained: %s", new_device_key[:20] + "...")
-        except MfaRequiredException:
-            logger.error("MFA required but callback not available during refresh")
-            raise
+                if self._on_device_key_changed:
+                    await self._on_device_key_changed(new_device_key)
+            if new_refresh_token and new_refresh_token != self._refresh_token:
+                self._refresh_token = new_refresh_token
+                logger.info("Refresh token obtained")
+                if self._on_refresh_token_changed:
+                    await self._on_refresh_token_changed(new_refresh_token)
+        except MfaRequiredException as e:
+            # MFA required during auto-refresh means device_key expired/invalid
+            # This should stop monitoring - user needs to re-authenticate
+            logger.error(
+                "MFA required during token refresh (device_key invalid/expired). "
+                "User must re-authenticate via Telegram bot."
+            )
+            raise RuntimeError(
+                "Token refresh requires MFA. Please stop monitoring and re-authenticate via /start"
+            ) from e
+        except CognitoHttpError as e:
+            # Handle "Invalid Refresh Token" error - token expired, need re-auth
+            if e.status == 400 and "Invalid Refresh Token" in str(e):
+                logger.error("Refresh token invalid/expired - user must re-authenticate")
+                raise RuntimeError(
+                    "Refresh token expired. Please stop monitoring and re-authenticate via /start"
+                ) from e
+            # Handle "Device does not exist" error - reset device_key and retry
+            elif e.status == 400 and "Device does not exist" in str(e):
+                logger.warning("Device key expired/invalid, resetting and retrying without device tracking")
+                self._device_key = None
+                # Retry without device_key (use mfa_callback only during initial auth)
+                id_token, new_device_key, new_refresh_token = await get_id_token(
+                    self._session,
+                    client_id     = self._client_id,
+                    username      = self._username,
+                    password      = self._password,
+                    idp_endpoint  = self._idp_endpoint,
+                    mfa_callback  = self._mfa_callback if use_mfa_callback else None,
+                    device_key    = None,  # Don't use old device_key
+                    refresh_token = self._refresh_token,
+                )
+                if new_device_key and new_device_key != self._device_key:
+                    self._device_key = new_device_key
+                    logger.info("New device key obtained: %s", new_device_key[:20] + "...")
+                    if self._on_device_key_changed:
+                        await self._on_device_key_changed(new_device_key)
+                if new_refresh_token and new_refresh_token != self._refresh_token:
+                    self._refresh_token = new_refresh_token
+                    logger.info("Refresh token obtained")
+                    if self._on_refresh_token_changed:
+                        await self._on_refresh_token_changed(new_refresh_token)
+            else:
+                raise
 
         logger.info("Exchanging ID token for AWS STS credentials...")
         self._aws_credentials = await get_aws_credentials(
@@ -316,3 +504,4 @@ class CredentialManager:
             "STS credentials obtained (expire %s UTC)",
             self._aws_credentials.expiration.strftime("%H:%M:%S"),
         )
+

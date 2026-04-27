@@ -30,7 +30,17 @@ class OrderLog(Base):
     __tablename__ = "order_log"
 
     id:         Mapped[int]            = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id:    Mapped[int]            = mapped_column(Integer, nullable=False)  # User who took/failed the order
     order_slug: Mapped[str]            = mapped_column(String,  nullable=False)
     amount:     Mapped[Optional[float]] = mapped_column(Float,   nullable=True)
     status:     Mapped[str]            = mapped_column(String,  nullable=False)   # "taken" | "failed"
     taken_at:   Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuthorizedUser(Base):
+    __tablename__ = "authorized_users"
+
+    chat_id:        Mapped[int]            = mapped_column(Integer, primary_key=True)
+    authorized_at:  Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
+    refresh_token:  Mapped[Optional[str]]  = mapped_column(String, nullable=True)
+    device_key:     Mapped[Optional[str]]  = mapped_column(String, nullable=True)  # Needed for refresh_token auth

@@ -43,7 +43,15 @@ class App:
             ttl_dns_cache=600,
             keepalive_timeout=30
         )
-        self._session = aiohttp.ClientSession(connector=connector)
+
+        # Setup proxy if configured
+        session_kwargs = {"connector": connector}
+        if config.HTTP_PROXY or config.HTTPS_PROXY:
+            proxy = config.HTTPS_PROXY or config.HTTP_PROXY
+            logger.info("Using proxy: %s", proxy)
+            session_kwargs["trust_env"] = True  # Use HTTP_PROXY/HTTPS_PROXY from env
+
+        self._session = aiohttp.ClientSession(**session_kwargs)
 
         self._bot = Bot(
             token=config.TELEGRAM_BOT_TOKEN,
@@ -67,6 +75,10 @@ class App:
             await self.stop_all_sessions()
             await self._bot.session.close()
             await self._session.close()
+
+            # Cleanup curl_cffi session (for CloudFront WAF bypass)
+            from cognito_auth import cleanup_curl_session
+            await cleanup_curl_session()
 
     @property
     def http_session(self) -> aiohttp.ClientSession:
@@ -115,13 +127,13 @@ class App:
         self._user_sessions.clear()
         logger.info("All sessions stopped")
 
-    async def _on_taken(self, chat_id: int, slug: str, amount: Optional[float]) -> None:
+    async def _on_taken(self, chat_id: int, slug: str, amount: Optional[float], error_reason: Optional[str]) -> None:
         """Callback when order is taken for a specific user."""
         session = self._user_sessions.get(chat_id)
         if session:
             session.orders_taken += 1
 
-        await self._log_order(slug, amount, "taken")
+        await self._log_order(chat_id, slug, amount, "taken")
         amount_str = f"{amount:,.0f} RUB" if amount is not None else "—"
 
         if self._bot:
@@ -135,18 +147,80 @@ class App:
             except Exception as exc:
                 logger.warning("Failed to send 'taken' notification to %s: %s", chat_id, exc)
 
-    async def _on_failed(self, chat_id: int, slug: str, amount: Optional[float]) -> None:
+    async def _on_failed(self, chat_id: int, slug: str, amount: Optional[float], error_reason: Optional[str]) -> None:
         """Callback when order failed for a specific user."""
         session = self._user_sessions.get(chat_id)
         if session:
             session.orders_failed += 1
 
-        await self._log_order(slug, amount, "failed")
-        logger.warning("Order %s failed for chat_id=%s (amount=%s)", slug, chat_id, amount)
+        await self._log_order(chat_id, slug, amount, "failed")
+        logger.warning("Order %s failed for chat_id=%s (amount=%s) reason=%s", slug, chat_id, amount, error_reason)
+
+        # Format user-friendly error message
+        amount_str = f"{amount:,.0f} RUB" if amount is not None else "—"
+
+        if error_reason == "race_condition":
+            # Race condition - already taken by someone else
+            message = (
+                f"⏭️ <b>Ордер уже взят</b>\n\n"
+                f"ID: <code>{slug}</code>\n"
+                f"Сумма: <b>{amount_str}</b>\n\n"
+                f"Другой трейдер был быстрее"
+            )
+        elif error_reason == "insufficient_balance":
+            # Not enough balance
+            message = (
+                f"❌ <b>Ордер не взят</b>\n\n"
+                f"ID: <code>{slug}</code>\n"
+                f"Сумма: <b>{amount_str}</b>\n\n"
+                f"💸 Недостаточно средств на балансе\n"
+                f"Пополните баланс и попробуйте снова"
+            )
+        elif error_reason and error_reason.startswith("api_error:"):
+            # API error with message
+            error_msg = error_reason.replace("api_error: ", "")
+            message = (
+                f"❌ <b>Ордер не взят</b>\n\n"
+                f"ID: <code>{slug}</code>\n"
+                f"Сумма: <b>{amount_str}</b>\n\n"
+                f"Ошибка API: {error_msg}"
+            )
+        else:
+            # Unknown error
+            message = (
+                f"❌ <b>Ордер не взят</b>\n\n"
+                f"ID: <code>{slug}</code>\n"
+                f"Сумма: <b>{amount_str}</b>\n\n"
+                f"Ошибка: {error_reason or 'Неизвестная ошибка'}"
+            )
+
+        # Send notification to user
+        if self._bot:
+            try:
+                await self._bot.send_message(chat_id, message)
+            except Exception as exc:
+                logger.warning("Failed to send 'failed' notification to %s: %s", chat_id, exc)
 
     async def _on_monitor_error(self, chat_id: int, exc: Exception) -> None:
         """Callback when monitor error occurs for a specific user."""
-        if isinstance(exc, ApiError) and exc.is_rate_limited:
+        if isinstance(exc, RuntimeError) and "Token refresh requires MFA" in str(exc):
+            # Device key expired - user must re-authenticate
+            session = self._user_sessions.get(chat_id)
+            if session:
+                await session.stop_monitoring()
+
+            if self._bot:
+                try:
+                    await self._bot.send_message(
+                        chat_id,
+                        "🔐 <b>Требуется повторная авторизация</b>\n\n"
+                        "Срок действия токена истёк. Для продолжения работы необходимо авторизоваться заново.\n\n"
+                        "Используйте /start для повторной авторизации."
+                    )
+                except Exception as send_exc:
+                    logger.warning("Failed to send MFA required notification to %s: %s", chat_id, send_exc)
+
+        elif isinstance(exc, ApiError) and exc.is_rate_limited:
             session = self._user_sessions.get(chat_id)
             poll_interval = session.poll_interval if session else "?"
 
@@ -185,11 +259,11 @@ class App:
             except Exception as exc:
                 logger.warning("Failed to send startup notification to %s: %s", chat_id, exc)
 
-    async def _log_order(self, slug: str, amount: Optional[float], status: str) -> None:
+    async def _log_order(self, chat_id: int, slug: str, amount: Optional[float], status: str) -> None:
         try:
             async with get_session() as session:
                 repo = OrderLogRepository(session)
-                await repo.add(slug, amount, status)
+                await repo.add(chat_id, slug, amount, status)
         except Exception as exc:
             logger.warning("Failed to log order %s to DB: %s", slug, exc)
 

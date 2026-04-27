@@ -53,7 +53,32 @@ async def main_menu(callback: CallbackQuery, app) -> None:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, app) -> None:
+    import config
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from db.engine import get_session
+    from db.repository import AuthorizedUserRepository
+
     chat_id = message.chat.id
+
+    # Check if invite code system is enabled
+    if config.INVITE_CODE:
+        async with get_session() as db_session:
+            auth_repo = AuthorizedUserRepository(db_session)
+            is_authorized = await auth_repo.is_authorized(chat_id)
+
+        if not is_authorized:
+            # User needs to enter invite code first
+            builder = InlineKeyboardBuilder()
+            builder.button(text="🔑 Ввести код приглашения", callback_data="invite:enter")
+
+            await message.answer(
+                "<b>Cards2Cards бот</b>\n\n"
+                "Этот бот доступен только по приглашениям.\n\n"
+                "Для использования бота необходим пригласительный код.",
+                reply_markup=builder.as_markup(),
+            )
+            return
+
     user_session = app.get_session(chat_id)
 
     if not user_session:

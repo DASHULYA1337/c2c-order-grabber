@@ -15,6 +15,9 @@ async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 _MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN poll_interval REAL NOT NULL DEFAULT 1.0",
+    "ALTER TABLE authorized_users ADD COLUMN refresh_token TEXT",
+    "ALTER TABLE authorized_users ADD COLUMN device_key TEXT",
+    "ALTER TABLE order_log ADD COLUMN chat_id INTEGER NOT NULL DEFAULT 0",
 ]
 
 

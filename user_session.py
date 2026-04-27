@@ -49,6 +49,10 @@ class UserSession:
         self,
         session:      aiohttp.ClientSession,
         mfa_callback: Optional[MfaCodeCallback] = None,
+        device_key:   Optional[str] = None,
+        refresh_token: Optional[str] = None,
+        on_device_key_changed: Optional[callable] = None,
+        on_refresh_token_changed: Optional[callable] = None,
     ) -> None:
         """Initialize credentials and API client."""
         logger.info("Initializing session for user %s (chat_id=%s)", self.username, self.chat_id)
@@ -63,6 +67,10 @@ class UserSession:
             region           = config.AWS_REGION,
             idp_endpoint     = config.COGNITO_IDP_ENDPOINT,
             mfa_callback     = mfa_callback,
+            device_key       = device_key,
+            refresh_token    = refresh_token,
+            on_device_key_changed = on_device_key_changed,
+            on_refresh_token_changed = on_refresh_token_changed,
         )
 
         await self.cred_mgr.initialize()
@@ -106,6 +114,7 @@ class UserSession:
         self.processor = OrderProcessor(
             client    = self.api_client,
             queue     = self._queue,
+            trader_id = self.trader_id,
             on_taken  = on_taken,
             on_failed = on_failed,
         )

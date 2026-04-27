@@ -31,6 +31,13 @@ TRADER_ID            = os.environ.get("TRADER_ID", "").strip()
 TELEGRAM_BOT_TOKEN = _require("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID      = _require("ADMIN_CHAT_ID")
 
+# Access Control (optional - if not set, bot is open to everyone)
+INVITE_CODE = os.environ.get("INVITE_CODE", "").strip()
+
+# Optional proxy support (HTTP/HTTPS/SOCKS5)
+HTTP_PROXY  = os.environ.get("HTTP_PROXY", "").strip() or None
+HTTPS_PROXY = os.environ.get("HTTPS_PROXY", "").strip() or None
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/bot.db")
 LOG_FILE     = os.environ.get("LOG_FILE", "").strip() or None
 

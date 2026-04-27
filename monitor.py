@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional, Set
 
 from api_client import ApiClient, ApiError
+from cognito_auth import CognitoHttpError
 from config import LOOKBACK_MINUTES, MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,29 @@ class OrderMonitor:
 
             except asyncio.CancelledError:
                 break
+            except CognitoHttpError as exc:
+                latency = time.monotonic() - start
+                if exc.status == 403:
+                    # CloudFront WAF block - wait longer
+                    logger.error(
+                        "Poll error after %.1fms: HTTP 403 Forbidden (CloudFront WAF block)",
+                        latency * 1000
+                    )
+                    logger.warning("🔴 Detected IP block - waiting 5 minutes before retry...")
+                    logger.warning("💡 Tip: Use VPN/proxy or wait for automatic unblock")
+                    if self._on_error:
+                        try:
+                            await self._on_error(exc)
+                        except Exception as cb_exc:
+                            logger.warning("Error callback failed: %s", cb_exc)
+                    if not self._running:
+                        break
+                    await asyncio.sleep(300.0)  # Wait 5 minutes
+                    continue
+                else:
+                    logger.exception("Poll error after %.1fms: HTTP %d", latency * 1000, exc.status)
+                    await asyncio.sleep(30.0)
+                    continue
             except ApiError as exc:
                 latency = time.monotonic() - start
                 if exc.status == 429:
@@ -99,21 +124,58 @@ class OrderMonitor:
                         break
                     await asyncio.sleep(30.0)
                     continue
+                elif exc.status == 403:
+                    # CloudFront WAF block - wait longer
+                    logger.error(
+                        "Poll error after %.1fms: HTTP 403 Forbidden (WAF block): %s",
+                        latency * 1000, exc.body[:200]
+                    )
+                    logger.warning("Detected WAF block - waiting 5 minutes before retry...")
+                    if self._on_error:
+                        try:
+                            await self._on_error(exc)
+                        except Exception as cb_exc:
+                            logger.warning("Error callback failed: %s", cb_exc)
+                    if not self._running:
+                        break
+                    await asyncio.sleep(300.0)  # Wait 5 minutes
+                    continue
                 logger.exception("Poll error after %.1fms: %s", latency * 1000, exc)
+            except RuntimeError as exc:
+                # Token refresh failures (MFA required) should stop monitoring
+                latency = time.monotonic() - start
+                logger.error("Poll error after %.1fms: %s", latency * 1000, exc)
+                if self._on_error:
+                    try:
+                        await self._on_error(exc)
+                    except Exception as cb_exc:
+                        logger.warning("Error callback failed: %s", cb_exc)
+                # Stop monitoring - user must re-authenticate
+                self._running = False
+                break
             except Exception as exc:
                 latency = time.monotonic() - start
                 logger.exception("Poll error after %.1fms: %s", latency * 1000, exc)
             if not self._running:
                 break
-            await asyncio.sleep(self.poll_interval)
+
+            # Add random jitter (±20%) to avoid detection as bot
+            jitter = random.uniform(0.8, 1.2)
+            sleep_time = self.poll_interval * jitter
+            logger.debug("Sleeping for %.2fs (jitter: %.1f%%)", sleep_time, (jitter - 1) * 100)
+            await asyncio.sleep(sleep_time)
 
     async def _poll(self) -> None:
         since  = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
         orders = await self._client.get_orders(self._trader_id, since)
 
+        # Log what API returned
+        logger.debug("API returned %d orders (trader_id=%s)", len(orders), self._trader_id)
+
         if self._first_poll:
             self._first_poll = False
             primed = 0
+            in_range = 0
             for order in orders:
                 slug = _slug(order)
                 if not slug:
@@ -122,10 +184,12 @@ class OrderMonitor:
                 if not self._in_range(amount):
                     self._seen.add(slug)
                     primed += 1
+                else:
+                    in_range += 1
             logger.info(
                 "First poll: primed %d out-of-range order(s) into seen set"
                 " (%d in-range order(s) will be taken on next poll)",
-                primed, len(orders) - primed,
+                primed, in_range,
             )
             if self._on_startup:
                 try:
@@ -135,19 +199,35 @@ class OrderMonitor:
             return
 
         enqueued = 0
+        skipped_seen = 0
+        skipped_out_of_range = 0
+
         for order in orders:
             slug = _slug(order)
-            if not slug or slug in self._seen:
+            if not slug:
+                continue
+
+            if slug in self._seen:
+                skipped_seen += 1
                 continue
 
             amount = _rub_amount(order)
             if not self._in_range(amount):
                 self._seen.add(slug)
+                skipped_out_of_range += 1
+                logger.debug("Skipped order %s: amount=%.2f (out of range)", slug, amount or 0.0)
                 continue
 
             self._seen.add(slug)
+            logger.info("NEW order found: %s amount=%.2f RUB", slug, amount or 0.0)
             await self._queue.put({"slug": slug, "amount": amount, "raw": order})
             enqueued += 1
+
+        # Log summary after each poll (in DEBUG mode)
+        logger.debug(
+            "Poll summary: %d total, %d new (enqueued), %d already seen, %d out-of-range",
+            len(orders), enqueued, skipped_seen, skipped_out_of_range
+        )
 
         if enqueued:
             logger.info("Enqueued %d new order(s)", enqueued)

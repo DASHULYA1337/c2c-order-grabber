@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+class InviteCodeFSM(StatesGroup):
+    waiting_code = State()
+
+
 class AuthFSM(StatesGroup):
     email     = State()
     password  = State()
@@ -145,6 +149,21 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
     # Initialize session with MFA callback
     status_msg = await message.answer("⏳ Авторизация...")
 
+    # Load saved refresh_token and device_key from database
+    from db.engine import get_session as get_db_session
+    from db.repository import AuthorizedUserRepository
+
+    device_key = None
+    refresh_token = None
+    async with get_db_session() as db_session:
+        auth_repo = AuthorizedUserRepository(db_session)
+        device_key = await auth_repo.get_device_key(chat_id)
+        refresh_token = await auth_repo.get_refresh_token(chat_id)
+        if device_key:
+            logger.info("Loaded device_key for chat_id=%s", chat_id)
+        if refresh_token:
+            logger.info("Loaded refresh_token for chat_id=%s", chat_id)
+
     # Create MFA callback if needed
     mfa_event = asyncio.Event()
     mfa_code_holder = {'code': None}
@@ -159,6 +178,20 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
         await mfa_event.wait()
         return mfa_code_holder['code']
 
+    async def on_device_key_changed(new_device_key: str | None) -> None:
+        """Save device_key to database when it changes."""
+        async with get_db_session() as db_session:
+            auth_repo = AuthorizedUserRepository(db_session)
+            await auth_repo.save_device_key(chat_id, new_device_key)
+            logger.info("Saved device_key for chat_id=%s", chat_id)
+
+    async def on_refresh_token_changed(new_refresh_token: str | None) -> None:
+        """Save refresh_token to database when it changes."""
+        async with get_db_session() as db_session:
+            auth_repo = AuthorizedUserRepository(db_session)
+            await auth_repo.save_refresh_token(chat_id, new_refresh_token)
+            logger.info("Saved refresh_token for chat_id=%s", chat_id)
+
     # Store callback data in FSM for MFA handler
     await state.update_data(
         mfa_event=mfa_event,
@@ -168,7 +201,14 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
     )
 
     try:
-        await session.initialize(session=app.http_session, mfa_callback=mfa_callback)
+        await session.initialize(
+            session=app.http_session,
+            mfa_callback=mfa_callback,
+            device_key=device_key,
+            refresh_token=refresh_token,
+            on_device_key_changed=on_device_key_changed,
+            on_refresh_token_changed=on_refresh_token_changed,
+        )
 
         await status_msg.delete()
         await message.answer(
@@ -179,9 +219,13 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
         )
     except Exception as exc:
         logger.exception("Session initialization failed for chat_id=%s", chat_id)
+        # Limit error message length and escape HTML
+        error_msg = str(exc)[:300]
+        error_msg = error_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
         await status_msg.edit_text(
             f"❌ <b>Ошибка авторизации</b>\n\n"
-            f"<code>{str(exc)}</code>\n\n"
+            f"<code>{error_msg}</code>\n\n"
             "Попробуйте авторизоваться заново: /start"
         )
         await app.remove_session(chat_id)
@@ -236,3 +280,77 @@ async def auth_logout(callback: CallbackQuery, state: FSMContext, app: App) -> N
         reply_markup=main_menu_keyboard(is_running=False, is_authenticated=False),
     )
     await callback.answer("Вы успешно вышли из системы.")
+
+
+# ============================================================================
+# Invite Code Handlers
+# ============================================================================
+
+@router.callback_query(F.data == "invite:enter")
+async def invite_code_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Start invite code entry flow."""
+    await state.clear()
+    await callback.message.edit_text(
+        "🔐 <b>Доступ по приглашению</b>\n\n"
+        "Этот бот доступен только по приглашениям.\n"
+        "Введите пригласительный код:",
+    )
+    await state.set_state(InviteCodeFSM.waiting_code)
+    await callback.answer()
+
+
+@router.message(InviteCodeFSM.waiting_code)
+async def invite_code_check(message: Message, state: FSMContext, app: App) -> None:
+    """Check invite code."""
+    import config
+    from db.engine import get_session
+    from db.repository import AuthorizedUserRepository
+
+    code = message.text.strip()
+    chat_id = message.chat.id
+
+    # Delete code message for security
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Check if invite code is configured
+    if not config.INVITE_CODE:
+        await message.answer("❌ Система приглашений не настроена. Обратитесь к администратору.")
+        await state.clear()
+        return
+
+    # Check code
+    if code == config.INVITE_CODE:
+        # Authorize user
+        async with get_session() as db_session:
+            auth_repo = AuthorizedUserRepository(db_session)
+            await auth_repo.authorize(chat_id)
+
+        await state.clear()
+        from bot.keyboards import main_menu_keyboard
+        await message.answer(
+            "✅ <b>Код принят!</b>\n\n"
+            "Добро пожаловать! Теперь вы можете использовать бота.\n"
+            "Для начала работы необходимо авторизоваться с вашим аккаунтом Cards2Cards.",
+            reply_markup=main_menu_keyboard(is_running=False, is_authenticated=False),
+        )
+    else:
+        # Invalid code
+        data = await state.get_data()
+        attempts = data.get('attempts', 0) + 1
+
+        if attempts >= 3:
+            await state.clear()
+            await message.answer(
+                "❌ <b>Превышено количество попыток</b>\n\n"
+                "Слишком много неверных попыток ввода кода.\n"
+                "Попробуйте позже: /start"
+            )
+        else:
+            await state.update_data(attempts=attempts)
+            await message.answer(
+                f"❌ Неверный код. Попытка {attempts}/3.\n\n"
+                "Попробуйте еще раз:"
+            )

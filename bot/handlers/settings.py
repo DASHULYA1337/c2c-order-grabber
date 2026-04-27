@@ -163,11 +163,11 @@ async def filters_save(callback: CallbackQuery, state: FSMContext, app) -> None:
         await session.stop_monitoring()
 
         # Recreate callbacks
-        async def on_taken(slug: str, amount: float | None) -> None:
-            await app._on_taken(chat_id, slug, amount)
+        async def on_taken(slug: str, amount: float | None, error_reason: str | None) -> None:
+            await app._on_taken(chat_id, slug, amount, error_reason)
 
-        async def on_failed(slug: str, amount: float | None) -> None:
-            await app._on_failed(chat_id, slug, amount)
+        async def on_failed(slug: str, amount: float | None, error_reason: str | None) -> None:
+            await app._on_failed(chat_id, slug, amount, error_reason)
 
         async def on_error(exc: Exception) -> None:
             await app._on_monitor_error(chat_id, exc)
@@ -251,11 +251,11 @@ async def poll_interval_set(message: Message, state: FSMContext, app) -> None:
         await session.stop_monitoring()
 
         # Recreate callbacks
-        async def on_taken(slug: str, amount: float | None) -> None:
-            await app._on_taken(chat_id, slug, amount)
+        async def on_taken(slug: str, amount: float | None, error_reason: str | None) -> None:
+            await app._on_taken(chat_id, slug, amount, error_reason)
 
-        async def on_failed(slug: str, amount: float | None) -> None:
-            await app._on_failed(chat_id, slug, amount)
+        async def on_failed(slug: str, amount: float | None, error_reason: str | None) -> None:
+            await app._on_failed(chat_id, slug, amount, error_reason)
 
         async def on_error(exc: Exception) -> None:
             await app._on_monitor_error(chat_id, exc)
