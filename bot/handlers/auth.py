@@ -149,20 +149,11 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
     # Initialize session with MFA callback
     status_msg = await message.answer("⏳ Авторизация...")
 
-    # Load saved refresh_token and device_key from database
+    # NOTE: Don't load old tokens during manual re-authentication
+    # User explicitly asked to log in, so we should get fresh tokens with password + MFA
+    # Old tokens will be overwritten with new ones after successful auth
     from db.engine import get_session as get_db_session
     from db.repository import AuthorizedUserRepository
-
-    device_key = None
-    refresh_token = None
-    async with get_db_session() as db_session:
-        auth_repo = AuthorizedUserRepository(db_session)
-        device_key = await auth_repo.get_device_key(chat_id)
-        refresh_token = await auth_repo.get_refresh_token(chat_id)
-        if device_key:
-            logger.info("Loaded device_key for chat_id=%s", chat_id)
-        if refresh_token:
-            logger.info("Loaded refresh_token for chat_id=%s", chat_id)
 
     # Create MFA callback if needed
     mfa_event = asyncio.Event()
@@ -204,8 +195,8 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
         await session.initialize(
             session=app.http_session,
             mfa_callback=mfa_callback,
-            device_key=device_key,
-            refresh_token=refresh_token,
+            device_key=None,  # Don't use old device_key - get fresh one
+            refresh_token=None,  # Don't use old refresh_token - get fresh one
             on_device_key_changed=on_device_key_changed,
             on_refresh_token_changed=on_refresh_token_changed,
         )
