@@ -217,58 +217,26 @@ async def get_id_token(
     password:         str,
     idp_endpoint:     str = "https://idp.cards2cards.com",
     mfa_callback:     Optional[MfaCodeCallback] = None,
-    device_key:       Optional[str] = None,
-    refresh_token:    Optional[str] = None,
-) -> tuple[str, Optional[str], Optional[str]]:
+) -> str:
     """
     Authenticate with Cognito via the CloudFront proxy and return an ID token.
 
-    Uses USER_PASSWORD_AUTH flow (or REFRESH_TOKEN_AUTH if refresh_token provided).
+    Uses USER_PASSWORD_AUTH flow with MFA support.
     The custom endpoint bypasses the WAF that protects the direct cognito-idp.*.amazonaws.com endpoint.
 
+    User will re-authenticate with password + MFA every time token expires (~1 hour).
+
     Returns:
-        tuple[str, Optional[str], Optional[str]]: (id_token, new_device_key, refresh_token)
+        str: ID token (JWT)
 
     Raises:
         MfaRequiredException: If MFA is required but no callback provided
     """
-    # If refresh token available, try refreshing first (no password/MFA needed)
-    if refresh_token:
-        logger.info("Attempting token refresh using refresh_token...")
-        auth_params = {"REFRESH_TOKEN": refresh_token}
-
-        # IMPORTANT: When device tracking is enabled, device_key MUST be included
-        # AWS Cognito docs: "to get new tokens with a refresh token, you must include the device key"
-        if device_key:
-            auth_params["DEVICE_KEY"] = device_key
-            logger.debug("Including device_key in refresh request: %s", device_key[:20] + "...")
-
-        refresh_data = await _post(
-            session,
-            url     = idp_endpoint.rstrip("/") + "/",
-            target  = "AWSCognitoIdentityProviderService.InitiateAuth",
-            payload = {
-                "AuthFlow": "REFRESH_TOKEN_AUTH",
-                "ClientId": client_id,
-                "AuthParameters": auth_params,
-            },
-        )
-        if "AuthenticationResult" in refresh_data:
-            id_token = refresh_data["AuthenticationResult"]["IdToken"]
-            # Refresh doesn't return new refresh_token or device_key, keep existing ones
-            logger.info("Token refreshed successfully using refresh_token")
-            return id_token, device_key, refresh_token
-        else:
-            # Refresh token invalid - this should trigger re-authentication
-            raise RuntimeError("Refresh token invalid/expired - re-authentication required")
-
-    # Password authentication (only during initial login)
+    # Password authentication
     auth_params = {
         "USERNAME": username,
         "PASSWORD": password,
     }
-    if device_key:
-        auth_params["DEVICE_KEY"] = device_key
 
     data = await _post(
         session,
@@ -284,15 +252,8 @@ async def get_id_token(
     # Check if authentication succeeded without MFA
     if "AuthenticationResult" in data:
         id_token = data["AuthenticationResult"]["IdToken"]
-        access_token = data["AuthenticationResult"]["AccessToken"]
-        new_device_key = data["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
-        new_refresh_token = data["AuthenticationResult"].get("RefreshToken")
-
-        # Confirm device if new device key was issued
-        if new_device_key:
-            await _confirm_device(session, access_token, new_device_key, idp_endpoint)
-
-        return id_token, new_device_key, new_refresh_token
+        logger.info("Authentication successful (no MFA)")
+        return id_token
 
     # Check if MFA challenge is required
     challenge_name = data.get("ChallengeName")
@@ -327,15 +288,8 @@ async def get_id_token(
             raise RuntimeError(f"MFA challenge failed. Response: {response}")
 
         id_token = response["AuthenticationResult"]["IdToken"]
-        access_token = response["AuthenticationResult"]["AccessToken"]
-        new_device_key = response["AuthenticationResult"].get("NewDeviceMetadata", {}).get("DeviceKey")
-        new_refresh_token = response["AuthenticationResult"].get("RefreshToken")
-
-        # Confirm device if new device key was issued
-        if new_device_key:
-            await _confirm_device(session, access_token, new_device_key, idp_endpoint)
-
-        return id_token, new_device_key, new_refresh_token
+        logger.info("Authentication successful (with MFA)")
+        return id_token
 
     raise RuntimeError(
         f"InitiateAuth returned unexpected response. Response: {data}"
@@ -430,10 +384,6 @@ class CredentialManager:
         region:           str,
         idp_endpoint:     str = "https://idp.cards2cards.com",
         mfa_callback:     Optional[MfaCodeCallback] = None,
-        device_key:       Optional[str] = None,
-        refresh_token:    Optional[str] = None,
-        on_device_key_changed: Optional[Callable[[Optional[str]], Awaitable[None]]] = None,
-        on_refresh_token_changed: Optional[Callable[[Optional[str]], Awaitable[None]]] = None,
     ) -> None:
         self._session          = session
         self._username         = username
@@ -445,96 +395,39 @@ class CredentialManager:
         self._idp_endpoint     = idp_endpoint
         self._mfa_callback     = mfa_callback
         self._aws_credentials: Optional[AwsCredentials] = None
-        self._device_key:      Optional[str] = device_key  # Persisted - needed for refresh_token
-        self._refresh_token:   Optional[str] = refresh_token
-        self._on_device_key_changed = on_device_key_changed
-        self._on_refresh_token_changed = on_refresh_token_changed
         self._lock:            Lock = Lock()
 
     async def initialize(self) -> None:
         logger.info("Authenticating (user=%s)...", self._username)
-        await self._refresh(use_mfa_callback=True)  # Initial auth - allow MFA
+        await self._refresh()  # Initial auth with MFA
 
     async def get_credentials(self) -> AwsCredentials:
         if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
             async with self._lock:
                 if self._aws_credentials is None or self._aws_credentials.is_expiring_soon():
-                    await self._refresh(use_mfa_callback=False)  # Auto-refresh - no MFA
+                    # Token expired - require re-authentication with password + MFA
+                    raise RuntimeError(
+                        "AWS credentials expired (~1 hour). "
+                        "Please stop monitoring and re-authenticate via /start"
+                    )
         return self._aws_credentials  # type: ignore[return-value]
 
     async def force_refresh(self) -> None:
         async with self._lock:
-            await self._refresh(use_mfa_callback=False)  # Manual refresh - no MFA
+            await self._refresh()  # Manual refresh with MFA
 
-    async def _refresh(self, use_mfa_callback: bool = False) -> None:
+    async def _refresh(self) -> None:
+        """Authenticate with password + MFA and obtain AWS STS credentials."""
         logger.info("Obtaining Cognito ID token via %s ...", self._idp_endpoint)
-        try:
-            # During initial auth, use mfa_callback to prompt user
-            # During auto-refresh, use refresh_token (no password/MFA needed!)
-            id_token, new_device_key, new_refresh_token = await get_id_token(
-                self._session,
-                client_id     = self._client_id,
-                username      = self._username,
-                password      = self._password,
-                idp_endpoint  = self._idp_endpoint,
-                mfa_callback  = self._mfa_callback if use_mfa_callback else None,
-                device_key    = self._device_key,
-                refresh_token = self._refresh_token,
-            )
-            if new_device_key and new_device_key != self._device_key:
-                self._device_key = new_device_key
-                logger.info("Device key obtained: %s", new_device_key[:20] + "...")
-                if self._on_device_key_changed:
-                    await self._on_device_key_changed(new_device_key)
-            if new_refresh_token and new_refresh_token != self._refresh_token:
-                self._refresh_token = new_refresh_token
-                logger.info("Refresh token obtained")
-                if self._on_refresh_token_changed:
-                    await self._on_refresh_token_changed(new_refresh_token)
-        except MfaRequiredException as e:
-            # MFA required during auto-refresh means device_key expired/invalid
-            # This should stop monitoring - user needs to re-authenticate
-            logger.error(
-                "MFA required during token refresh (device_key invalid/expired). "
-                "User must re-authenticate via Telegram bot."
-            )
-            raise RuntimeError(
-                "Token refresh requires MFA. Please stop monitoring and re-authenticate via /start"
-            ) from e
-        except CognitoHttpError as e:
-            # Handle "Invalid Refresh Token" error - token expired, need re-auth
-            if e.status == 400 and "Invalid Refresh Token" in str(e):
-                logger.error("Refresh token invalid/expired - user must re-authenticate")
-                raise RuntimeError(
-                    "Refresh token expired. Please stop monitoring and re-authenticate via /start"
-                ) from e
-            # Handle "Device does not exist" error - reset device_key and retry
-            elif e.status == 400 and "Device does not exist" in str(e):
-                logger.warning("Device key expired/invalid, resetting and retrying without device tracking")
-                self._device_key = None
-                # Retry without device_key (use mfa_callback only during initial auth)
-                id_token, new_device_key, new_refresh_token = await get_id_token(
-                    self._session,
-                    client_id     = self._client_id,
-                    username      = self._username,
-                    password      = self._password,
-                    idp_endpoint  = self._idp_endpoint,
-                    mfa_callback  = self._mfa_callback if use_mfa_callback else None,
-                    device_key    = None,  # Don't use old device_key
-                    refresh_token = self._refresh_token,
-                )
-                if new_device_key and new_device_key != self._device_key:
-                    self._device_key = new_device_key
-                    logger.info("New device key obtained: %s", new_device_key[:20] + "...")
-                    if self._on_device_key_changed:
-                        await self._on_device_key_changed(new_device_key)
-                if new_refresh_token and new_refresh_token != self._refresh_token:
-                    self._refresh_token = new_refresh_token
-                    logger.info("Refresh token obtained")
-                    if self._on_refresh_token_changed:
-                        await self._on_refresh_token_changed(new_refresh_token)
-            else:
-                raise
+
+        id_token = await get_id_token(
+            self._session,
+            client_id     = self._client_id,
+            username      = self._username,
+            password      = self._password,
+            idp_endpoint  = self._idp_endpoint,
+            mfa_callback  = self._mfa_callback,
+        )
 
         logger.info("Exchanging ID token for AWS STS credentials...")
         self._aws_credentials = await get_aws_credentials(

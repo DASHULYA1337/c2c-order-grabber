@@ -40,7 +40,5 @@ class OrderLog(Base):
 class AuthorizedUser(Base):
     __tablename__ = "authorized_users"
 
-    chat_id:        Mapped[int]            = mapped_column(Integer, primary_key=True)
-    authorized_at:  Mapped[datetime]       = mapped_column(DateTime, default=datetime.utcnow)
-    refresh_token:  Mapped[Optional[str]]  = mapped_column(String, nullable=True)
-    device_key:     Mapped[Optional[str]]  = mapped_column(String, nullable=True)  # Needed for refresh_token auth
+    chat_id:        Mapped[int]      = mapped_column(Integer, primary_key=True)
+    authorized_at:  Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

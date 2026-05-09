@@ -169,20 +169,6 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
         await mfa_event.wait()
         return mfa_code_holder['code']
 
-    async def on_device_key_changed(new_device_key: str | None) -> None:
-        """Save device_key to database when it changes."""
-        async with get_db_session() as db_session:
-            auth_repo = AuthorizedUserRepository(db_session)
-            await auth_repo.save_device_key(chat_id, new_device_key)
-            logger.info("Saved device_key for chat_id=%s", chat_id)
-
-    async def on_refresh_token_changed(new_refresh_token: str | None) -> None:
-        """Save refresh_token to database when it changes."""
-        async with get_db_session() as db_session:
-            auth_repo = AuthorizedUserRepository(db_session)
-            await auth_repo.save_refresh_token(chat_id, new_refresh_token)
-            logger.info("Saved refresh_token for chat_id=%s", chat_id)
-
     # Store callback data in FSM for MFA handler
     await state.update_data(
         mfa_event=mfa_event,
@@ -195,10 +181,6 @@ async def auth_trader_id(message: Message, state: FSMContext, app: App) -> None:
         await session.initialize(
             session=app.http_session,
             mfa_callback=mfa_callback,
-            device_key=None,  # Don't use old device_key - get fresh one
-            refresh_token=None,  # Don't use old refresh_token - get fresh one
-            on_device_key_changed=on_device_key_changed,
-            on_refresh_token_changed=on_refresh_token_changed,
         )
 
         await status_msg.delete()

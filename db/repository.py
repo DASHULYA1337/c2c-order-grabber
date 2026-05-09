@@ -105,27 +105,3 @@ class AuthorizedUserRepository:
         if existing is None:
             self._session.add(AuthorizedUser(chat_id=chat_id))
             await self._session.commit()
-
-    async def get_refresh_token(self, chat_id: int) -> Optional[str]:
-        """Get stored refresh token for user."""
-        user = await self._session.get(AuthorizedUser, chat_id)
-        return user.refresh_token if user else None
-
-    async def save_refresh_token(self, chat_id: int, refresh_token: Optional[str]) -> None:
-        """Save refresh token for user."""
-        user = await self._session.get(AuthorizedUser, chat_id)
-        if user:
-            user.refresh_token = refresh_token
-            await self._session.commit()
-
-    async def get_device_key(self, chat_id: int) -> Optional[str]:
-        """Get stored device key for user."""
-        user = await self._session.get(AuthorizedUser, chat_id)
-        return user.device_key if user else None
-
-    async def save_device_key(self, chat_id: int, device_key: Optional[str]) -> None:
-        """Save device key for user."""
-        user = await self._session.get(AuthorizedUser, chat_id)
-        if user:
-            user.device_key = device_key
-            await self._session.commit()
