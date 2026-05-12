@@ -203,8 +203,8 @@ class App:
 
     async def _on_monitor_error(self, chat_id: int, exc: Exception) -> None:
         """Callback when monitor error occurs for a specific user."""
-        if isinstance(exc, RuntimeError) and "Token refresh requires MFA" in str(exc):
-            # Device key expired - user must re-authenticate
+        if isinstance(exc, RuntimeError) and "AWS credentials expired" in str(exc):
+            # AWS credentials expired (~1 hour) - user must re-authenticate
             session = self._user_sessions.get(chat_id)
             if session:
                 await session.stop_monitoring()
@@ -214,11 +214,11 @@ class App:
                     await self._bot.send_message(
                         chat_id,
                         "🔐 <b>Требуется повторная авторизация</b>\n\n"
-                        "Срок действия токена истёк. Для продолжения работы необходимо авторизоваться заново.\n\n"
+                        "Срок действия токена истёк (~1 час). Для продолжения работы необходимо авторизоваться заново.\n\n"
                         "Используйте /start для повторной авторизации."
                     )
                 except Exception as send_exc:
-                    logger.warning("Failed to send MFA required notification to %s: %s", chat_id, send_exc)
+                    logger.warning("Failed to send auth required notification to %s: %s", chat_id, send_exc)
 
         elif isinstance(exc, ApiError) and exc.is_rate_limited:
             session = self._user_sessions.get(chat_id)
