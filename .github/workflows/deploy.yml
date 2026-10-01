@@ -36,8 +36,9 @@ jobs:
 
       - name: Get SSH key from AWS
         run: |
-          # Получаем приватный ключ из AWS Secrets Manager или создаем новый
-          aws lightsail download-default-key-pair \
+          # Get private key from Lightsail key pair created by Terraform
+          aws lightsail download-key-pair \
+            --key-pair-name c2c-order-grabber-key \
             --region ${{ env.AWS_REGION }} \
             --output text \
             --query 'privateKeyBase64' | base64 -d > private_key.pem
