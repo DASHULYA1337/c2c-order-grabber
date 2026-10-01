@@ -33,10 +33,7 @@ cd c2c-order-grabber
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # Linux/macOS
-# or
-venv\Scripts\activate     # Windows
-```
+source venv/bin/activate
 
 ### 3. Install dependencies
 
