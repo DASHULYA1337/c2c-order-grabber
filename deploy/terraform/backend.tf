@@ -7,7 +7,6 @@ terraform {
     key            = "lightsail/terraform.tfstate"
     region         = "eu-north-1"
     encrypt        = true
-    use_lockfile   = true
     dynamodb_table = "c2c-bot-terraform-locks"
   }
 }
