@@ -45,14 +45,9 @@ jobs:
             --output text)
           echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
 
-      - name: Get SSH key from AWS
+      - name: Setup SSH key
         run: |
-          # Get private key from Lightsail key pair created by Terraform
-          aws lightsail download-key-pair \
-            --key-pair-name c2c-order-grabber-key \
-            --region ${{ env.AWS_REGION }} \
-            --output text \
-            --query 'privateKeyBase64' | base64 -d > private_key.pem
+          echo "${{ secrets.LIGHTSAIL_SSH_KEY }}" > private_key.pem
           chmod 600 private_key.pem
 
       - name: Update code on server
