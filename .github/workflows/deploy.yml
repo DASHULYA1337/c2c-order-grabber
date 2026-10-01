@@ -56,15 +56,13 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$INSTANCE_IP << 'ENDSSH'
             set -e
-            cd /home/c2cbot/c2c-order-grabber
 
-            # Pull latest code
-            sudo -u c2cbot git fetch origin
-            sudo -u c2cbot git reset --hard origin/main
+            # Pull latest code as c2cbot user
+            sudo -u c2cbot bash -c 'cd /home/c2cbot/c2c-order-grabber && git fetch origin && git reset --hard origin/main'
 
             # Update dependencies if requirements.txt changed
-            if git diff HEAD@{1} --name-only | grep -q requirements.txt; then
-              sudo -u c2cbot /home/c2cbot/c2c-order-grabber/venv/bin/pip install -r requirements.txt
+            if sudo -u c2cbot bash -c 'cd /home/c2cbot/c2c-order-grabber && git diff HEAD@{1} --name-only' | grep -q requirements.txt; then
+              sudo -u c2cbot bash -c 'cd /home/c2cbot/c2c-order-grabber && venv/bin/pip install -r requirements.txt'
             fi
 
             # Restart service
