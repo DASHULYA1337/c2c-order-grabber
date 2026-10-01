@@ -1,13 +1,50 @@
-.env
-data/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-bot.log
-geckodriver.log
-*.db
-*.sqlite
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
 .venv/
+env/
+ENV/
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Logs
+*.log
+logs/
+geckodriver.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/.terraform.lock.hcl
+deploy/terraform/terraform.tfstate
+deploy/terraform/terraform.tfstate.backup
+deploy/terraform/*.tfvars
+deploy/terraform/.terraform.tfstate.lock.info
+
+# SSH Keys
 *.pem
-*.md
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+backups/
