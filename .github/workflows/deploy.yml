@@ -4,7 +4,14 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'deploy/terraform/**'
+      - '**.md'
   workflow_dispatch: # Manual trigger
+  workflow_run:
+    workflows: ["Terraform Infrastructure"]
+    types:
+      - completed
 
 env:
   AWS_REGION: eu-north-1
@@ -13,6 +20,10 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Only run if triggered by push/manual OR if terraform workflow succeeded
+    if: |
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
 
     steps:
       - name: Checkout code
