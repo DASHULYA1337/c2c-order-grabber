@@ -1,0 +1,80 @@
+name: Deploy to AWS Lightsail
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Manual trigger
+
+env:
+  AWS_REGION: eu-north-1
+  INSTANCE_NAME: c2c-order-grabber
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Lightsail instance IP
+        id: get-ip
+        run: |
+          INSTANCE_IP=$(aws lightsail get-instance \
+            --instance-name ${{ env.INSTANCE_NAME }} \
+            --query 'instance.publicIpAddress' \
+            --output text)
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+
+      - name: Get SSH key from AWS
+        run: |
+          # Получаем приватный ключ из AWS Secrets Manager или создаем новый
+          aws lightsail download-default-key-pair \
+            --region ${{ env.AWS_REGION }} \
+            --output text \
+            --query 'privateKeyBase64' | base64 -d > private_key.pem
+          chmod 600 private_key.pem
+
+      - name: Update code on server
+        env:
+          INSTANCE_IP: ${{ steps.get-ip.outputs.instance_ip }}
+        run: |
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$INSTANCE_IP << 'ENDSSH'
+            set -e
+            cd /home/c2cbot/c2c-order-grabber
+
+            # Pull latest code
+            sudo -u c2cbot git fetch origin
+            sudo -u c2cbot git reset --hard origin/main
+
+            # Update dependencies if requirements.txt changed
+            if git diff HEAD@{1} --name-only | grep -q requirements.txt; then
+              sudo -u c2cbot /home/c2cbot/c2c-order-grabber/venv/bin/pip install -r requirements.txt
+            fi
+
+            # Restart service
+            sudo systemctl restart c2c-bot.service
+
+            # Show status
+            sleep 3
+            sudo systemctl status c2c-bot.service --no-pager
+          ENDSSH
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f private_key.pem
+
+      - name: Deployment notification
+        if: success()
+        run: |
+          echo "Deployment successful!"
+          echo "Instance IP: ${{ steps.get-ip.outputs.instance_ip }}"
