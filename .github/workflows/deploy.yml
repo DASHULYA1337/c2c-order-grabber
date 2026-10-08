@@ -51,22 +51,11 @@ jobs:
           echo "${{ secrets.LIGHTSAIL_SSH_KEY }}" > private_key.pem
           chmod 600 private_key.pem
 
-      - name: Wait for cloud-init to complete
-        env:
-          INSTANCE_IP: ${{ steps.get-ip.outputs.instance_ip }}
+      - name: Wait for instance to be ready
         run: |
-          echo "Waiting for cloud-init to complete..."
-          timeout 300 bash -c '
-            until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i private_key.pem ubuntu@$INSTANCE_IP "cloud-init status --wait" 2>/dev/null; do
-              echo "Still waiting for cloud-init..."
-              sleep 10
-            done
-          '
-          echo "Cloud-init completed!"
-
-          # Verify c2cbot user exists
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$INSTANCE_IP "id c2cbot"
-
+          echo "Waiting 3 minutes for instance initialization..."
+          sleep 180
+        
       - name: Update code on server
         env:
           INSTANCE_IP: ${{ steps.get-ip.outputs.instance_ip }}
