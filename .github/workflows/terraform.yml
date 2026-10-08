@@ -66,18 +66,18 @@ jobs:
         continue-on-error: false
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve tfplan
 
       - name: Terraform Output
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         id: output
         run: |
           echo "static_ip=$(terraform output -raw static_ip)" >> $GITHUB_OUTPUT
           echo "ssh_command=$(terraform output -raw ssh_command)" >> $GITHUB_OUTPUT
 
       - name: Save SSH Key
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main'
         run: |
           terraform output -raw private_key > private_key.pem
           # Save to GitHub Secrets via API (optional)
