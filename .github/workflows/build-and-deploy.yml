@@ -7,7 +7,12 @@ on:
     paths-ignore:
       - '**.md'
       - '.github/workflows/terraform.yml'
+      - 'deploy/terraform/**'
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Terraform Infrastructure"]
+    types:
+      - completed
 
 env:
   AWS_REGION: eu-north-1
