@@ -7,6 +7,7 @@ on:
     paths-ignore:
       - 'deploy/terraform/**'
       - '**.md'
+      - '.github/workflows/terraform.yml'
   workflow_dispatch: # Manual trigger
   workflow_run:
     workflows: ["Terraform Infrastructure"]

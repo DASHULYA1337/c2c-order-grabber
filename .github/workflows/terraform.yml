@@ -6,9 +6,11 @@ on:
       - main
     paths:
       - 'deploy/terraform/**'
+      - '.github/workflows/terraform.yml'
   pull_request:
     paths:
       - 'deploy/terraform/**'
+      - '.github/workflows/terraform.yml'
   workflow_dispatch:
 
 env:
