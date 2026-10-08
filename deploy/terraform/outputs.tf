@@ -1,25 +1,24 @@
-output "instance_id" {
-  description = "Lightsail instance ID"
-  value       = aws_lightsail_instance.c2c_bot.id
+output "container_service_name" {
+  description = "Lightsail Container Service name"
+  value       = aws_lightsail_container_service.c2c_bot.name
 }
 
-output "instance_name" {
-  description = "Lightsail instance name"
-  value       = aws_lightsail_instance.c2c_bot.name
+output "container_service_url" {
+  description = "Container Service URL"
+  value       = aws_lightsail_container_service.c2c_bot.url
 }
 
-output "static_ip" {
-  description = "Static IP address"
-  value       = aws_lightsail_static_ip.c2c_bot.ip_address
+output "container_service_status" {
+  description = "Container Service status"
+  value       = aws_lightsail_container_service.c2c_bot.state
 }
 
-output "ssh_command" {
-  description = "SSH command to connect"
-  value       = "ssh -i ${aws_lightsail_key_pair.c2c_bot.name}.pem ubuntu@${aws_lightsail_static_ip.c2c_bot.ip_address}"
+output "container_service_power" {
+  description = "Container Service power level"
+  value       = aws_lightsail_container_service.c2c_bot.power
 }
 
-output "private_key" {
-  description = "Private SSH key (save to file)"
-  value       = aws_lightsail_key_pair.c2c_bot.private_key
-  sensitive   = true
+output "container_service_scale" {
+  description = "Number of container instances"
+  value       = aws_lightsail_container_service.c2c_bot.scale
 }

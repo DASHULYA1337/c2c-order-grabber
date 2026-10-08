@@ -11,9 +11,40 @@ variable "instance_name" {
 }
 
 variable "bundle_id" {
-  description = "Lightsail bundle ID (instance size)"
+  description = "Lightsail bundle ID"
   type        = string
   default     = "small_3_0"
+}
+
+variable "container_power" {
+  description = "Container service power"
+  type        = string
+  default     = "micro"
+}
+
+variable "container_scale" {
+  description = "Number of container instances"
+  type        = number
+  default     = 1
+}
+
+variable "docker_registry_username" {
+  description = "Docker registry username (e.g., Docker Hub username)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "docker_image_name" {
+  description = "Docker image name (without username/registry)"
+  type        = string
+  default     = "c2c-order-grabber"
+}
+
+variable "docker_image_tag" {
+  description = "Docker image tag"
+  type        = string
+  default     = "latest"
 }
 
 variable "environment" {
@@ -40,7 +71,6 @@ variable "ssh_allowed_ips" {
   default     = ["0.0.0.0/0"]
 }
 
-# Secret variables (passed via GitHub Secrets or terraform.tfvars)
 variable "telegram_bot_token" {
   description = "Telegram Bot Token"
   type        = string

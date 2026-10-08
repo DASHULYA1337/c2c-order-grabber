@@ -62,6 +62,7 @@ jobs:
             -var="invite_code=${{ secrets.INVITE_CODE }}" \
             -var="http_proxy=${{ secrets.HTTP_PROXY }}" \
             -var="https_proxy=${{ secrets.HTTPS_PROXY }}" \
+            -var="docker_registry_username=${{ secrets.DOCKERHUB_USERNAME }}" \
             -out=tfplan
         continue-on-error: false
 
@@ -73,15 +74,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         id: output
         run: |
-          echo "static_ip=$(terraform output -raw static_ip)" >> $GITHUB_OUTPUT
-          echo "ssh_command=$(terraform output -raw ssh_command)" >> $GITHUB_OUTPUT
-
-      - name: Save SSH Key
-        if: github.ref == 'refs/heads/main'
-        run: |
-          terraform output -raw private_key > private_key.pem
-          # Save to GitHub Secrets via API (optional)
-          # or output instructions for manual save
+          terraform output
 
       - name: Comment PR
         if: github.event_name == 'pull_request'
