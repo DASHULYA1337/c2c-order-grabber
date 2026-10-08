@@ -13,7 +13,7 @@ variable "instance_name" {
 variable "bundle_id" {
   description = "Lightsail bundle ID (instance size)"
   type        = string
-  default     = "nano_3_0"
+  default     = "micro_3_0"
 }
 
 variable "environment" {
